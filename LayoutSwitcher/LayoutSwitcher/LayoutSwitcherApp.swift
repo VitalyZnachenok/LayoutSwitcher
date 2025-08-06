@@ -7,7 +7,11 @@ class SettingsManager: ObservableObject {
     @Published var modifierFlags: NSEvent.ModifierFlags = [.command, .shift]
     @Published var keyCode: UInt16 = 0x25 // L по умолчанию
     @Published var keyCharacter: String = "L"
-    @Published var useDoubleShift: Bool = false // Новое свойство
+    @Published var useDoubleShift: Bool = false
+    
+    // Новые настройки тайминга для двойного Shift
+    @Published var minDoubleShiftInterval: Double = 0.05 // Минимум 50ms между нажатиями
+    @Published var maxDoubleShiftInterval: Double = 0.8  // Максимум 800ms между нажатиями
     
     private let userDefaults = UserDefaults.standard
     
@@ -56,6 +60,17 @@ class SettingsManager: ObservableObject {
         
         keyCharacter = userDefaults.string(forKey: "keyCharacter") ?? "L"
         useDoubleShift = userDefaults.bool(forKey: "useDoubleShift")
+        
+        // Загружаем настройки тайминга
+        let savedMinInterval = userDefaults.double(forKey: "minDoubleShiftInterval")
+        if savedMinInterval > 0 {
+            minDoubleShiftInterval = savedMinInterval
+        }
+        
+        let savedMaxInterval = userDefaults.double(forKey: "maxDoubleShiftInterval")
+        if savedMaxInterval > 0 {
+            maxDoubleShiftInterval = savedMaxInterval
+        }
     }
     
     func saveSettings() {
@@ -63,6 +78,10 @@ class SettingsManager: ObservableObject {
         userDefaults.set(Int(keyCode), forKey: "keyCode")
         userDefaults.set(keyCharacter, forKey: "keyCharacter")
         userDefaults.set(useDoubleShift, forKey: "useDoubleShift")
+        
+        // Сохраняем настройки тайминга
+        userDefaults.set(minDoubleShiftInterval, forKey: "minDoubleShiftInterval")
+        userDefaults.set(maxDoubleShiftInterval, forKey: "maxDoubleShiftInterval")
         
         // Уведомляем об изменениях
         NotificationCenter.default.post(name: .settingsDidChange, object: nil)
@@ -88,21 +107,33 @@ struct LayoutSwitcherApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var statusBarItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
-    private var settingsWindow: NSWindow?
+    private weak var settingsWindow: NSWindow? // ИЗМЕНЕНО: weak ссылка
     private let settings = SettingsManager()
     
-    // Для двойного нажатия Shift
-    private var shiftKeyMonitor: Any?
+    // Для двойного нажатия Shift - гибридный подход
+    private var leftShiftHotKeyRef: EventHotKeyRef?
+    private var rightShiftHotKeyRef: EventHotKeyRef?
     private var lastShiftPressTime: TimeInterval = 0
-    private let doubleShiftTimeInterval: TimeInterval = 0.8 // Увеличиваем до 800ms
+    
+    // Дополнительные переменные для мониторинга
+    private var wasShiftPressed = false
+    private var shiftPollingTimer: Timer?
+    private var previousShiftState = false
+    private var lastShiftReleaseTime: TimeInterval = 0 // Время последнего отпускания Shift
+    private var shiftPressCount = 0 // Счетчик нажатий Shift
+    private var isShiftSequenceActive = false // Флаг активной последовательности
+    
+    // Сохраняем ссылки на мониторы для корректного удаления
+    private var localShiftMonitor: Any?
+    private var globalShiftMonitor: Any?
     
     // Карты для конвертации между русской и английской раскладками
     let rusToEng: [Character: Character] = [
-        "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t", "н": "y", "г": "u", "ш": "i", "щ": "o", "з": "p",
+        "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t", "н": "y", "г": "u", "ш": "i", "щ": "o", "з": "p", "х": "[", "ъ": "]",
         "ф": "a", "ы": "s", "в": "d", "а": "f", "п": "g", "р": "h", "о": "j", "л": "k", "д": "l", "ж": ";", "э": "'",
         "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b", "т": "n", "ь": "m", "б": ",", "ю": ".", ".": "/",
         
-        "Й": "Q", "Ц": "W", "У": "E", "К": "R", "Е": "T", "Н": "Y", "Г": "U", "Ш": "I", "Щ": "O", "З": "P",
+        "Й": "Q", "Ц": "W", "У": "E", "К": "R", "Е": "T", "Н": "Y", "Г": "U", "Ш": "I", "Щ": "O", "З": "P", "Х": "{", "Ъ": "}",
         "Ф": "A", "Ы": "S", "В": "D", "А": "F", "П": "G", "Р": "H", "О": "J", "Л": "K", "Д": "L", "Ж": ":", "Э": "\"",
         "Я": "Z", "Ч": "X", "С": "C", "М": "V", "И": "B", "Т": "N", "Ь": "M", "Б": "<", "Ю": ">", ",": "?",
         
@@ -110,11 +141,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     ]
     
     let engToRus: [Character: Character] = [
-        "q": "й", "w": "ц", "e": "у", "r": "к", "t": "е", "y": "н", "u": "г", "i": "ш", "o": "щ", "p": "з",
+        "q": "й", "w": "ц", "e": "у", "r": "к", "t": "е", "y": "н", "u": "г", "i": "ш", "o": "щ", "p": "з", "[": "х", "]": "ъ",
         "a": "ф", "s": "ы", "d": "в", "f": "а", "g": "п", "h": "р", "j": "о", "k": "л", "l": "д", ";": "ж", "'": "э",
         "z": "я", "x": "ч", "c": "с", "v": "м", "b": "и", "n": "т", "m": "ь", ",": "б", ".": "ю", "/": ".",
         
-        "Q": "Й", "W": "Ц", "E": "У", "R": "К", "T": "Е", "Y": "Н", "U": "Г", "I": "Ш", "O": "Щ", "P": "З",
+        "Q": "Й", "W": "Ц", "E": "У", "R": "К", "T": "Е", "Y": "Н", "U": "Г", "I": "Ш", "O": "Щ", "P": "З", "{": "Х", "}": "Ъ",
         "A": "Ф", "S": "Ы", "D": "В", "F": "А", "G": "П", "H": "Р", "J": "О", "K": "Л", "L": "Д", ":": "Ж", "\"": "Э",
         "Z": "Я", "X": "Ч", "C": "С", "V": "М", "B": "И", "N": "Т", "M": "Ь", "<": "Б", ">": "Ю", "?": ",",
         
@@ -141,7 +172,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         setupHotKeySystem()
     }
     
-    // Новая функция для настройки системы горячих клавиш
+    // Функция для настройки системы горячих клавиш
     private func setupHotKeySystem() {
         // Отключаем предыдущие системы
         unregisterHotKey()
@@ -151,94 +182,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             setupDoubleShiftMonitor()
         } else {
             setupGlobalHotKey()
-        }
-    }
-    
-    // Мониторинг двойного нажатия Shift
-    private func setupDoubleShiftMonitor() {
-        print("⌨️ Настраиваем двойное нажатие Shift...")
-        
-        // Метод 1: NSEvent мониторы
-        shiftKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 0x38 || event.keyCode == 0x3C { // Left Shift или Right Shift
-                print("🔍 Локальный Shift: \(event.keyCode)")
-                self?.handleShiftPress()
-                return event
-            }
-            return event
-        }
-        
-        // Метод 2: Carbon Events для более надежного глобального мониторинга
-        setupCarbonShiftMonitor()
-        
-        print("✅ Мониторинг двойного Shift активирован (NSEvent + Carbon)")
-    }
-    
-    // Дополнительный мониторинг через Carbon Events
-    private func setupCarbonShiftMonitor() {
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventRawKeyDown))
-        
-        InstallEventHandler(
-            GetApplicationEventTarget(),
-            { (nextHandler, theEvent, userData) -> OSStatus in
-                var keyCode: UInt32 = 0
-                GetEventParameter(theEvent, OSType(kEventParamKeyCode), OSType(typeUInt32), nil, MemoryLayout<UInt32>.size, nil, &keyCode)
-                
-                // Проверяем коды клавиш Shift
-                if keyCode == 0x38 || keyCode == 0x3C {
-                    if let userData = userData {
-                        let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-                        print("🔍 Carbon Shift: \(keyCode)")
-                        DispatchQueue.main.async {
-                            appDelegate.handleShiftPress()
-                        }
-                    }
-                }
-                
-                return CallNextEventHandler(nextHandler, theEvent)
-            },
-            1,
-            &eventType,
-            Unmanaged.passUnretained(self).toOpaque(),
-            nil
-        )
-    }
-    
-    private func handleShiftPress() {
-        let currentTime = Date().timeIntervalSince1970
-        let timeDiff = currentTime - lastShiftPressTime
-        
-        print("🔍 Shift нажат. Время между нажатиями: \(String(format: "%.3f", timeDiff))s")
-        
-        if timeDiff <= doubleShiftTimeInterval && timeDiff > 0.05 { // Минимум 50ms между нажатиями
-            // Двойное нажатие обнаружено!
-            print("🔥 ДВОЙНОЕ НАЖАТИЕ SHIFT ОБНАРУЖЕНО! Переключаем раскладку...")
-            DispatchQueue.main.async { [weak self] in
-                self?.switchLayout()
-            }
-            lastShiftPressTime = 0 // Сбрасываем чтобы избежать тройных нажатий
-        } else {
-            print("📝 Первое нажатие Shift или слишком долгий интервал")
-            lastShiftPressTime = currentTime
-        }
-    }
-    
-    // Тестовый метод для проверки двойного Shift
-    func testDoubleShift() {
-        print("🧪 Тестируем двойное нажатие Shift...")
-        
-        // Имитируем два быстрых нажатия
-        handleShiftPress()
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.handleShiftPress()
-        }
-    }
-    
-    private func removeShiftKeyMonitor() {
-        if let monitor = shiftKeyMonitor {
-            NSEvent.removeMonitor(monitor)
-            shiftKeyMonitor = nil
         }
     }
     
@@ -374,6 +317,180 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
     }
     
+    // Мониторинг двойного нажатия Shift - новый гибридный подход
+    private func setupDoubleShiftMonitor() {
+        print("⌨️ Настраиваем ГИБРИДНОЕ двойное нажатие Shift...")
+        
+        // Метод 1: Локальный мониторинг для работы внутри приложения
+        setupLocalShiftMonitor()
+        
+        // Метод 2: Глобальный мониторинг через NSEvent (работает частично)
+        setupGlobalShiftMonitor()
+        
+        // Метод 3: Polling как backup
+        setupShiftPolling()
+        
+        print("✅ Гибридный мониторинг Shift активирован (локальный + глобальный + polling)")
+        print("📝 Попробуйте двойной Shift!")
+    }
+    
+    // Локальный мониторинг для работы внутри приложения
+    private func setupLocalShiftMonitor() {
+        localShiftMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
+            
+            if event.type == .keyDown {
+                // Прямое нажатие клавиш
+                if event.keyCode == 0x38 || event.keyCode == 0x3C {
+                    print("🏠 ЛОКАЛЬНЫЙ Shift keyDown: код \(event.keyCode)")
+                    self?.handleShiftPress()
+                }
+            } else if event.type == .keyUp {
+                // Отпускание клавиш Shift
+                if event.keyCode == 0x38 || event.keyCode == 0x3C {
+                    print("🏠 ЛОКАЛЬНЫЙ Shift keyUp: код \(event.keyCode)")
+                    self?.handleShiftRelease()
+                }
+            } else if event.type == .flagsChanged {
+                // Изменение флагов модификаторов
+                let hasShift = event.modifierFlags.contains(.shift)
+                
+                if hasShift && (self?.wasShiftPressed == false) {
+                    print("🏠 ЛОКАЛЬНЫЙ Shift через флаги (НАЖАТ)")
+                    self?.handleShiftPress()
+                    self?.wasShiftPressed = true
+                } else if !hasShift && (self?.wasShiftPressed == true) {
+                    print("🏠 ЛОКАЛЬНЫЙ Shift через флаги (ОТПУЩЕН)")
+                    self?.handleShiftRelease()
+                    self?.wasShiftPressed = false
+                }
+            }
+            
+            return event
+        }
+        
+        print("✅ Локальный Shift монитор создан (keyDown + keyUp + flagsChanged)")
+    }
+    
+    // Глобальный мониторинг (работает только для keyDown, не для всех приложений)
+    private func setupGlobalShiftMonitor() {
+        globalShiftMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 0x38 || event.keyCode == 0x3C {
+                print("🌍 ГЛОБАЛЬНЫЙ Shift keyDown: код \(event.keyCode)")
+                self?.handleShiftPress()
+            }
+        }
+        
+        if globalShiftMonitor != nil {
+            print("✅ Глобальный NSEvent монитор создан")
+        } else {
+            print("❌ Не удалось создать глобальный NSEvent монитор")
+        }
+    }
+    
+    // Polling как резервный метод
+    private func setupShiftPolling() {
+        shiftPollingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            
+            let currentFlags = NSEvent.modifierFlags
+            let currentShiftState = currentFlags.contains(.shift)
+            
+            if currentShiftState != self.previousShiftState {
+                if currentShiftState {
+                    print("⏰ POLLING Shift НАЖАТ")
+                    self.handleShiftPress()
+                } else {
+                    print("⏰ POLLING Shift ОТПУЩЕН")
+                    self.handleShiftRelease()
+                }
+                self.previousShiftState = currentShiftState
+            }
+        }
+        
+        print("✅ Polling мониторинг запущен (каждые 100ms, отслеживает нажатие + отпускание)")
+    }
+    
+    // Регистрация отдельной клавиши Shift как горячей клавиши
+    private func setupShiftHotKey(keyCode: UInt32, hotKeyRef: inout EventHotKeyRef?, id: UInt32, description: String) {
+        let hotKeyId = EventHotKeyID(signature: OSType(fourCharCode("LSWT")), id: id)
+        
+        // Регистрируем Shift БЕЗ модификаторов (только саму клавишу)
+        let status = RegisterEventHotKey(
+            keyCode,
+            0, // Никаких модификаторов!
+            hotKeyId,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+        
+        if status == noErr {
+            print("✅ Зарегистрирован \(description) как глобальная горячая клавиша")
+        } else {
+            print("❌ Ошибка регистрации \(description): \(status)")
+            
+            // Пробуем альтернативный подход с минимальными модификаторами
+            tryAlternativeShiftRegistration(keyCode: keyCode, hotKeyRef: &hotKeyRef, id: id, description: description)
+        }
+    }
+    
+    // Альтернативный подход - регистрируем с самим Shift как модификатором
+    private func tryAlternativeShiftRegistration(keyCode: UInt32, hotKeyRef: inout EventHotKeyRef?, id: UInt32, description: String) {
+        print("🔄 Пробуем альтернативную регистрацию \(description)...")
+        
+        let hotKeyId = EventHotKeyID(signature: OSType(fourCharCode("LSWT")), id: id)
+        
+        // Пробуем зарегистрировать как Shift+Shift (сам себе модификатор)
+        let status = RegisterEventHotKey(
+            keyCode,
+            UInt32(shiftKey),
+            hotKeyId,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+        
+        if status == noErr {
+            print("✅ Альтернативная регистрация \(description) успешна")
+        } else {
+            print("❌ Альтернативная регистрация \(description) не удалась: \(status)")
+        }
+    }
+    
+    // Единый обработчик для всех горячих клавиш
+    private func setupUnifiedHotKeyHandler() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
+        
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { (nextHandler, theEvent, userData) -> OSStatus in
+                if let userData = userData {
+                    let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                    
+                    // Получаем ID горячей клавиши
+                    var hotKeyId = EventHotKeyID()
+                    GetEventParameter(theEvent, OSType(kEventParamDirectObject), OSType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyId)
+                    
+                    DispatchQueue.main.async {
+                        if hotKeyId.id == 1 {
+                            // Обычная горячая клавиша
+                            appDelegate.handleHotKey()
+                        } else if hotKeyId.id == 2 || hotKeyId.id == 3 {
+                            // Shift нажат
+                            print("🌍 ГЛОБАЛЬНЫЙ Shift нажат: ID \(hotKeyId.id)")
+                            appDelegate.handleShiftPress()
+                        }
+                    }
+                }
+                return noErr
+            },
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            nil
+        )
+    }
+    
     private func setupGlobalHotKey() {
         // Сначала отменяем предыдущую горячую клавишу
         unregisterHotKey()
@@ -398,27 +515,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         } else {
             print("❌ Ошибка регистрации горячей клавиши: \(status)")
         }
-        
-        // Устанавливаем обработчик событий только один раз
-        if hotKeyRef != nil {
-            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
-            InstallEventHandler(
-                GetApplicationEventTarget(),
-                { (nextHandler, theEvent, userData) -> OSStatus in
-                    if let userData = userData {
-                        let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-                        DispatchQueue.main.async {
-                            appDelegate.handleHotKey()
-                        }
-                    }
-                    return noErr
-                },
-                1,
-                &eventType,
-                Unmanaged.passUnretained(self).toOpaque(),
-                nil
-            )
-        }
     }
     
     private func unregisterHotKey() {
@@ -428,9 +524,169 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
     }
     
+    private func removeShiftKeyMonitor() {
+        print("🧹 Начинаем очистку мониторов Shift...")
+        
+        // Отключаем горячие клавиши Shift
+        if let leftShiftHotKeyRef = leftShiftHotKeyRef {
+            let status = UnregisterEventHotKey(leftShiftHotKeyRef)
+            print("🔑 Отключена левая горячая клавиша Shift, статус: \(status)")
+            self.leftShiftHotKeyRef = nil
+        }
+        
+        if let rightShiftHotKeyRef = rightShiftHotKeyRef {
+            let status = UnregisterEventHotKey(rightShiftHotKeyRef)
+            print("🔑 Отключена правая горячая клавиша Shift, статус: \(status)")
+            self.rightShiftHotKeyRef = nil
+        }
+        
+        // Отключаем мониторы NSEvent
+        if let localMonitor = localShiftMonitor {
+            NSEvent.removeMonitor(localMonitor)
+            self.localShiftMonitor = nil
+            print("🏠 Локальный монитор отключен")
+        }
+        
+        if let globalMonitor = globalShiftMonitor {
+            NSEvent.removeMonitor(globalMonitor)
+            self.globalShiftMonitor = nil
+            print("🌍 Глобальный монитор отключен")
+        }
+        
+        // Отключаем polling timer
+        if let timer = shiftPollingTimer {
+            timer.invalidate()
+            self.shiftPollingTimer = nil
+            print("⏰ Polling timer отключен")
+        }
+        
+        // Сбрасываем все состояния
+        wasShiftPressed = false
+        previousShiftState = false
+        lastShiftPressTime = 0
+        lastShiftReleaseTime = 0
+        shiftPressCount = 0
+        isShiftSequenceActive = false
+        
+        print("✅ Все мониторы Shift отключены и состояния сброшены")
+    }
+    
     func handleHotKey() {
         print("🔥 Горячая клавиша нажата!")
         switchLayout()
+    }
+    
+    private func handleShiftPress() {
+        let currentTime = Date().timeIntervalSince1970
+        
+        // Если прошло слишком много времени с последнего отпускания, начинаем новую последовательность
+        if lastShiftReleaseTime > 0 && currentTime - lastShiftReleaseTime > settings.maxDoubleShiftInterval {
+            shiftPressCount = 1
+            isShiftSequenceActive = true
+            lastShiftPressTime = currentTime
+            print("🔍 Shift нажат #1 (новая последовательность после таймаута). Время с последнего отпускания: \(String(format: "%.3f", currentTime - lastShiftReleaseTime))s")
+            return
+        }
+        
+        // Если это не первое нажатие, проверяем интервал между нажатиями
+        if shiftPressCount > 0 {
+            let timeSinceLastPress = currentTime - lastShiftPressTime
+            if timeSinceLastPress > settings.maxDoubleShiftInterval {
+                // Прошло слишком много времени между нажатиями
+                shiftPressCount = 1
+                lastShiftPressTime = currentTime
+                print("🔍 Shift нажат #1 (таймаут между нажатиями). Интервал: \(String(format: "%.3f", timeSinceLastPress))s")
+                return
+            }
+        }
+        
+        shiftPressCount += 1
+        isShiftSequenceActive = true
+        
+        print("🔍 Shift нажат #\(shiftPressCount). Время с последнего нажатия: \(String(format: "%.3f", currentTime - lastShiftPressTime))s")
+        
+        if shiftPressCount == 1 {
+            // Первое нажатие
+            lastShiftPressTime = currentTime
+            print("📝 Первое нажатие Shift в последовательности")
+        } else if shiftPressCount == 2 {
+            // Второе нажатие - проверяем интервал
+            let timeDiff = currentTime - lastShiftPressTime
+            
+            print("⚙️ Настройки: мин=\(String(format: "%.3f", settings.minDoubleShiftInterval))s, макс=\(String(format: "%.3f", settings.maxDoubleShiftInterval))s")
+            print("⏱️ Интервал между нажатиями: \(String(format: "%.3f", timeDiff))s")
+            
+            if timeDiff >= settings.minDoubleShiftInterval && timeDiff <= settings.maxDoubleShiftInterval {
+                print("🔥 ДВОЙНОЕ НАЖАТИЕ SHIFT ОБНАРУЖЕНО! Интервал: \(String(format: "%.3f", timeDiff))s")
+                
+                // Выполняем переключение
+                DispatchQueue.main.async { [weak self] in
+                    self?.switchLayout()
+                }
+                
+                // Полный сброс состояния
+                shiftPressCount = 0
+                isShiftSequenceActive = false
+                lastShiftPressTime = 0
+                lastShiftReleaseTime = 0
+            } else {
+                if timeDiff < settings.minDoubleShiftInterval {
+                    print("⚠️ Слишком быстрое второе нажатие: \(String(format: "%.3f", timeDiff))s < \(String(format: "%.3f", settings.minDoubleShiftInterval))s")
+                } else {
+                    print("⏰ Слишком долгий интервал для второго нажатия: \(String(format: "%.3f", timeDiff))s > \(String(format: "%.3f", settings.maxDoubleShiftInterval))s")
+                }
+                
+                // Начинаем новую последовательность
+                shiftPressCount = 1
+                lastShiftPressTime = currentTime
+            }
+        } else if shiftPressCount > 2 {
+            // Больше двух нажатий - игнорируем и ждем отпускания
+            print("🚫 Игнорируем лишнее нажатие #\(shiftPressCount)")
+            // Не обновляем lastShiftPressTime, чтобы сохранить возможность двойного нажатия
+        }
+    }
+    
+    private func handleShiftRelease() {
+        let currentTime = Date().timeIntervalSince1970
+        lastShiftReleaseTime = currentTime
+        
+        print("📤 Shift отпущен. Счетчик: \(shiftPressCount), активна последовательность: \(isShiftSequenceActive)")
+        
+        // Если было больше 2 нажатий, сбрасываем состояние
+        if shiftPressCount > 2 {
+            print("🔄 Сброс после множественных нажатий")
+            shiftPressCount = 0
+            isShiftSequenceActive = false
+            lastShiftPressTime = 0
+            return
+        }
+        
+        // Запускаем таймер сброса, если последовательность не завершена
+        if isShiftSequenceActive && shiftPressCount > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + settings.maxDoubleShiftInterval + 0.1) { [weak self] in
+                guard let self = self else { return }
+                
+                // Сбрасываем счетчик если за максимальное время не было второго нажатия
+                if self.isShiftSequenceActive && self.shiftPressCount == 1 {
+                    print("⏳ Время вышло, сбрасываем счетчик нажатий")
+                    self.shiftPressCount = 0
+                    self.isShiftSequenceActive = false
+                    self.lastShiftPressTime = 0
+                }
+            }
+        }
+    }
+    
+    // Тестовый метод для проверки двойного Shift
+    func testDoubleShift() {
+        print("🧪 Тестируем систему переключения раскладки...")
+        
+        // Прямо вызываем switchLayout для проверки основной функциональности
+        switchLayout()
+        
+        print("✅ Если вы услышали звук - основная функция работает!")
+        print("📝 Теперь попробуйте реальное двойное нажатие Shift")
     }
     
     @objc func switchLayout() {
@@ -590,31 +846,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     
     func convertLayout(_ text: String) -> String {
         var result = ""
+        let lowercaseText = text.lowercased()
+        
+        // Определяем язык по преобладанию символов
+        var rusCount = 0
+        var engCount = 0
+        
+        for char in lowercaseText {
+            if rusToEng.keys.contains(char) {
+                rusCount += 1
+            } else if engToRus.keys.contains(char) {
+                engCount += 1
+            }
+        }
+        
+        // Определяем направление конвертации
+        let isRussianToEnglish = rusCount > engCount
+        
+        print("🔍 Анализ текста: рус=\(rusCount), eng=\(engCount), направление: \(isRussianToEnglish ? "RU→EN" : "EN→RU")")
         
         for char in text {
-            if let converted = rusToEng[char] {
-                result.append(converted)
-            } else if let converted = engToRus[char] {
-                result.append(converted)
+            if isRussianToEnglish {
+                // Конвертируем из русской в английскую
+                if let converted = rusToEng[char] {
+                    result.append(converted)
+                } else {
+                    result.append(char)
+                }
             } else {
-                result.append(char)
+                // Конвертируем из английской в русскую
+                if let converted = engToRus[char] {
+                    result.append(converted)
+                } else {
+                    result.append(char)
+                }
             }
         }
         
         return result
-    }
-    
-    func showNotification(_ title: String, _ message: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-        
-        // Показываем алерт в отдельном потоке
-        DispatchQueue.main.async {
-            alert.runModal()
-        }
     }
     
     func requestAccessibilityPermissions() {
@@ -629,23 +898,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
     }
     
+    // Оставляем функцию уведомлений только для системных сообщений
+    private func showNotification(_ title: String, _ message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        
+        // Показываем алерт в отдельном потоке
+        DispatchQueue.main.async {
+            alert.runModal()
+        }
+    }
+    
     @objc func showSettings() {
-        if settingsWindow == nil {
-            settingsWindow = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 500, height: 400),
-                styleMask: [.titled, .closable],
-                backing: .buffered,
-                defer: false
-            )
-            settingsWindow?.title = "Настройки Layout Switcher"
-            settingsWindow?.contentView = NSHostingView(rootView: SettingsView(settings: settings))
-            
-            // Добавляем обработчик закрытия окна
-            settingsWindow?.delegate = self
+        // ИЗМЕНЕНО: Проверяем существующее окно
+        if let existingWindow = settingsWindow, existingWindow.isVisible {
+            existingWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
         
-        settingsWindow?.center()
-        settingsWindow?.makeKeyAndOrderFront(nil)
+        // Создаем новое окно настроек
+        let newWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 650),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        
+        newWindow.title = "Настройки Layout Switcher"
+        newWindow.isReleasedWhenClosed = false // ИЗМЕНЕНО: предотвращаем автоматическое освобождение
+        
+        // ИЗМЕНЕНО: Создаем SettingsView с замыканием для закрытия окна
+        let settingsView = SettingsView(settings: settings) { [weak newWindow] in
+            newWindow?.close()
+        }
+        
+        newWindow.contentView = NSHostingView(rootView: settingsView)
+        newWindow.delegate = self
+        
+        // Сохраняем weak ссылку
+        settingsWindow = newWindow
+        
+        newWindow.center()
+        newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
     
@@ -685,6 +983,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
     
     func applicationWillTerminate(_ notification: Notification) {
+        // ИЗМЕНЕНО: Закрываем окно настроек если оно открыто
+        settingsWindow?.close()
+        settingsWindow = nil
+        
         unregisterHotKey()
         removeShiftKeyMonitor()
         NotificationCenter.default.removeObserver(self)
@@ -698,15 +1000,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 // MARK: - Расширение для обработки закрытия окна настроек
 extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        if notification.object as? NSWindow == settingsWindow {
+        // ИЗМЕНЕНО: улучшенная проверка
+        if let window = notification.object as? NSWindow, window == settingsWindow {
+            // Обнуляем ссылку
             settingsWindow = nil
         }
+    }
+    
+    // ИЗМЕНЕНО: добавлен метод
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Разрешаем закрытие окна
+        return true
     }
 }
 
 // MARK: - Интерфейс настроек
 struct SettingsView: View {
     @ObservedObject var settings: SettingsManager
+    let onClose: (() -> Void)? // ИЗМЕНЕНО: добавлено замыкание
     
     @State private var isRecording = false
     @State private var tempKeyCode: UInt16 = 0
@@ -726,6 +1037,12 @@ struct SettingsView: View {
         0x35: "⎋", 0x7A: "F1", 0x78: "F2", 0x63: "F3", 0x76: "F4", 0x60: "F5", 0x61: "F6", 0x62: "F7", 0x64: "F8",
         0x65: "F9", 0x6D: "F10", 0x67: "F11", 0x6F: "F12"
     ]
+    
+    // ИЗМЕНЕНО: добавлен инициализатор
+    init(settings: SettingsManager, onClose: (() -> Void)? = nil) {
+        self.settings = settings
+        self.onClose = onClose
+    }
     
     var body: some View {
         VStack(spacing: 20) {
@@ -772,21 +1089,117 @@ struct SettingsView: View {
                     }
                 
                 if settings.useDoubleShift {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 12) {
                         Text("💡 Быстро нажмите Shift два раза подряд для переключения раскладки")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         
-                        // Кнопка для тестирования
-                        Button("🧪 Тест двойного Shift") {
-                            // Имитируем двойное нажатие для тестирования
-                            if let appDelegate = NSApp.delegate as? AppDelegate {
-                                appDelegate.testDoubleShift()
+                        // Настройки тайминга
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("⏱️ Настройки тайминга:")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            
+                            HStack {
+                                Text("Минимальный интервал:")
+                                    .font(.caption)
+                                Spacer()
+                                Text("\(Int(settings.minDoubleShiftInterval * 1000))мс")
+                                    .font(.caption)
+                                    .foregroundColor(.blue)
+                            }
+                            
+                            Slider(value: $settings.minDoubleShiftInterval, in: 0.01...0.5, step: 0.01) {
+                                Text("Минимум")
+                            }
+                            .onChange(of: settings.minDoubleShiftInterval) { _ in
+                                // Обеспечиваем что минимум меньше максимума
+                                if settings.minDoubleShiftInterval >= settings.maxDoubleShiftInterval {
+                                    settings.maxDoubleShiftInterval = settings.minDoubleShiftInterval + 0.1
+                                }
+                                settings.saveSettings()
+                            }
+                            
+                            HStack {
+                                Text("Максимальный интервал:")
+                                    .font(.caption)
+                                Spacer()
+                                Text("\(Int(settings.maxDoubleShiftInterval * 1000))мс")
+                                    .font(.caption)
+                                    .foregroundColor(.blue)
+                            }
+                            
+                            Slider(value: $settings.maxDoubleShiftInterval, in: 0.1...2.0, step: 0.1) {
+                                Text("Максимум")
+                            }
+                            .onChange(of: settings.maxDoubleShiftInterval) { _ in
+                                // Обеспечиваем что максимум больше минимума
+                                if settings.maxDoubleShiftInterval <= settings.minDoubleShiftInterval {
+                                    settings.minDoubleShiftInterval = settings.maxDoubleShiftInterval - 0.1
+                                }
+                                settings.saveSettings()
+                            }
+                            
+                            // Предустановленные значения тайминга
+                            HStack {
+                                Button("Быстро") {
+                                    settings.minDoubleShiftInterval = 0.02
+                                    settings.maxDoubleShiftInterval = 0.4
+                                    settings.saveSettings()
+                                }
+                                .font(.caption)
+                                .buttonStyle(PlainButtonStyle())
+                                .foregroundColor(.green)
+                                
+                                Button("Средне") {
+                                    settings.minDoubleShiftInterval = 0.05
+                                    settings.maxDoubleShiftInterval = 0.8
+                                    settings.saveSettings()
+                                }
+                                .font(.caption)
+                                .buttonStyle(PlainButtonStyle())
+                                .foregroundColor(.blue)
+                                
+                                Button("Медленно") {
+                                    settings.minDoubleShiftInterval = 0.1
+                                    settings.maxDoubleShiftInterval = 1.5
+                                    settings.saveSettings()
+                                }
+                                .font(.caption)
+                                .buttonStyle(PlainButtonStyle())
+                                .foregroundColor(.orange)
                             }
                         }
-                        .buttonStyle(PlainButtonStyle())
-                        .foregroundColor(.blue)
-                        .font(.caption)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.blue.opacity(0.05))
+                        .cornerRadius(6)
+                        
+                        HStack(spacing: 12) {
+                            // Кнопка для тестирования основной функции
+                            Button("🧪 Тест переключения") {
+                                if let appDelegate = NSApp.delegate as? AppDelegate {
+                                    appDelegate.testDoubleShift()
+                                }
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            .foregroundColor(.green)
+                            .font(.caption)
+                            
+                            // Кнопка для ручного переключения
+                            Button("🔄 Переключить сейчас") {
+                                if let appDelegate = NSApp.delegate as? AppDelegate {
+                                    appDelegate.switchLayout()
+                                }
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                            .foregroundColor(.blue)
+                            .font(.caption)
+                        }
+                        
+                        Text("👆 Сначала выделите текст для проверки: 'ghbdtn' или 'привет'")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
                     }
                     .padding(.leading, 20)
                 }
@@ -795,6 +1208,8 @@ struct SettingsView: View {
             .padding(.vertical, 8)
             .background(Color.gray.opacity(0.1))
             .cornerRadius(8)
+            
+            Divider()
             
             // Кнопка записи новой комбинации
             VStack(alignment: .leading, spacing: 12) {
@@ -877,9 +1292,8 @@ struct SettingsView: View {
                 Spacer()
                 
                 Button("Готово") {
-                    if let window = NSApp.keyWindow {
-                        window.close()
-                    }
+                    // ИЗМЕНЕНО: используем замыкание
+                    onClose?()
                 }
                 .buttonStyle(PlainButtonStyle())
                 .foregroundColor(.blue)
@@ -888,11 +1302,16 @@ struct SettingsView: View {
             .padding(.bottom)
         }
         .padding()
-        .frame(width: 500, height: 400)
+        .frame(width: 600, height: 650)
+        .frame(minWidth: 500, maxWidth: 800, minHeight: 600, maxHeight: 800)
         .onAppear {
-            setupKeyEventMonitor()
+            // ИЗМЕНЕНО: проверка существования монитора
+            if keyEventMonitor == nil {
+                setupKeyEventMonitor()
+            }
         }
         .onDisappear {
+            // Обязательно удаляем монитор при исчезновении view
             removeKeyEventMonitor()
         }
     }
@@ -924,10 +1343,12 @@ struct SettingsView: View {
         settings.modifierFlags = [.command, .shift]
         settings.keyCode = 0x25
         settings.keyCharacter = "L"
+        settings.useDoubleShift = false // ИЗМЕНЕНО: добавлен сброс
         settings.saveSettings()
     }
     
     private func setupKeyEventMonitor() {
+        // Для struct не нужен weak self, так как нет retain cycle
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             if self.isRecording {
                 self.tempModifiers = event.modifierFlags.intersection([.command, .shift, .control, .option])
