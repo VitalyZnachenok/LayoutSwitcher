@@ -319,71 +319,74 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     
     // Мониторинг двойного нажатия Shift - новый гибридный подход
     private func setupDoubleShiftMonitor() {
-        print("⌨️ Настраиваем ГИБРИДНОЕ двойное нажатие Shift...")
+        print("⌨️ Настраиваем мониторинг двойного Shift...")
         
-        // Метод 1: Локальный мониторинг для работы внутри приложения
-        setupLocalShiftMonitor()
+        // Сбрасываем состояние
+        wasShiftPressed = false
+        previousShiftState = false
+        lastShiftPressTime = 0
+        lastShiftReleaseTime = 0
+        shiftPressCount = 0
+        isShiftSequenceActive = false
         
-        // Метод 2: Глобальный мониторинг через NSEvent (работает частично)
+        // Метод 1: Глобальный мониторинг через NSEvent (основной)
         setupGlobalShiftMonitor()
         
-        // Метод 3: Polling как backup
-        setupShiftPolling()
+        // Метод 2: Локальный мониторинг для работы внутри приложения
+        setupLocalShiftMonitor()
         
-        print("✅ Гибридный мониторинг Shift активирован (локальный + глобальный + polling)")
-        print("📝 Попробуйте двойной Shift!")
+        print("✅ Мониторинг Shift активирован")
+        print("📝 Настройки: мин=\(String(format: "%.0f", settings.minDoubleShiftInterval * 1000))ms, макс=\(String(format: "%.0f", settings.maxDoubleShiftInterval * 1000))ms")
     }
     
     // Локальный мониторинг для работы внутри приложения
     private func setupLocalShiftMonitor() {
-        localShiftMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
+        localShiftMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self = self else { return event }
             
-            if event.type == .keyDown {
-                // Прямое нажатие клавиш
-                if event.keyCode == 0x38 || event.keyCode == 0x3C {
-                    print("🏠 ЛОКАЛЬНЫЙ Shift keyDown: код \(event.keyCode)")
-                    self?.handleShiftPress()
-                }
-            } else if event.type == .keyUp {
-                // Отпускание клавиш Shift
-                if event.keyCode == 0x38 || event.keyCode == 0x3C {
-                    print("🏠 ЛОКАЛЬНЫЙ Shift keyUp: код \(event.keyCode)")
-                    self?.handleShiftRelease()
-                }
-            } else if event.type == .flagsChanged {
-                // Изменение флагов модификаторов
-                let hasShift = event.modifierFlags.contains(.shift)
-                
-                if hasShift && (self?.wasShiftPressed == false) {
-                    print("🏠 ЛОКАЛЬНЫЙ Shift через флаги (НАЖАТ)")
-                    self?.handleShiftPress()
-                    self?.wasShiftPressed = true
-                } else if !hasShift && (self?.wasShiftPressed == true) {
-                    print("🏠 ЛОКАЛЬНЫЙ Shift через флаги (ОТПУЩЕН)")
-                    self?.handleShiftRelease()
-                    self?.wasShiftPressed = false
-                }
+            let hasShift = event.modifierFlags.contains(.shift)
+            
+            // Отслеживаем только изменения состояния Shift
+            if hasShift && !self.wasShiftPressed {
+                // Shift нажат
+                self.handleShiftPress()
+                self.wasShiftPressed = true
+            } else if !hasShift && self.wasShiftPressed {
+                // Shift отпущен
+                self.handleShiftRelease()
+                self.wasShiftPressed = false
             }
             
             return event
         }
         
-        print("✅ Локальный Shift монитор создан (keyDown + keyUp + flagsChanged)")
+        print("✅ Локальный мониторинг Shift настроен")
     }
     
-    // Глобальный мониторинг (работает только для keyDown, не для всех приложений)
+    // Глобальный мониторинг (основной метод)
     private func setupGlobalShiftMonitor() {
-        globalShiftMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 0x38 || event.keyCode == 0x3C {
-                print("🌍 ГЛОБАЛЬНЫЙ Shift keyDown: код \(event.keyCode)")
-                self?.handleShiftPress()
+        // Мониторим flagsChanged глобально
+        globalShiftMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self = self else { return }
+            
+            let hasShift = event.modifierFlags.contains(.shift)
+            
+            // Отслеживаем только изменения состояния Shift
+            if hasShift && !self.previousShiftState {
+                // Shift нажат
+                self.handleShiftPress()
+            } else if !hasShift && self.previousShiftState {
+                // Shift отпущен
+                self.handleShiftRelease()
             }
+            
+            self.previousShiftState = hasShift
         }
         
         if globalShiftMonitor != nil {
-            print("✅ Глобальный NSEvent монитор создан")
+            print("✅ Глобальный мониторинг Shift настроен")
         } else {
-            print("❌ Не удалось создать глобальный NSEvent монитор")
+            print("❌ Не удалось настроить глобальный мониторинг")
         }
     }
     
@@ -579,103 +582,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private func handleShiftPress() {
         let currentTime = Date().timeIntervalSince1970
         
-        // Если прошло слишком много времени с последнего отпускания, начинаем новую последовательность
-        if lastShiftReleaseTime > 0 && currentTime - lastShiftReleaseTime > settings.maxDoubleShiftInterval {
+        // Если это первое нажатие или прошло много времени с последнего
+        if shiftPressCount == 0 || (currentTime - lastShiftReleaseTime) > settings.maxDoubleShiftInterval {
             shiftPressCount = 1
-            isShiftSequenceActive = true
             lastShiftPressTime = currentTime
-            print("🔍 Shift нажат #1 (новая последовательность после таймаута). Время с последнего отпускания: \(String(format: "%.3f", currentTime - lastShiftReleaseTime))s")
+            isShiftSequenceActive = true
+            print("🔵 Shift #1 - начало новой последовательности")
             return
         }
         
-        // Если это не первое нажатие, проверяем интервал между нажатиями
-        if shiftPressCount > 0 {
-            let timeSinceLastPress = currentTime - lastShiftPressTime
-            if timeSinceLastPress > settings.maxDoubleShiftInterval {
-                // Прошло слишком много времени между нажатиями
-                shiftPressCount = 1
-                lastShiftPressTime = currentTime
-                print("🔍 Shift нажат #1 (таймаут между нажатиями). Интервал: \(String(format: "%.3f", timeSinceLastPress))s")
-                return
-            }
+        // Проверяем интервал между нажатиями
+        let timeSinceLastPress = currentTime - lastShiftPressTime
+        
+        if timeSinceLastPress < settings.minDoubleShiftInterval {
+            // Слишком быстро, игнорируем
+            print("⚡ Слишком быстрое нажатие, игнорируем (интервал: \(String(format: "%.0f", timeSinceLastPress * 1000))ms)")
+            return
         }
         
-        shiftPressCount += 1
-        isShiftSequenceActive = true
-        
-        print("🔍 Shift нажат #\(shiftPressCount). Время с последнего нажатия: \(String(format: "%.3f", currentTime - lastShiftPressTime))s")
-        
-        if shiftPressCount == 1 {
-            // Первое нажатие
+        if timeSinceLastPress > settings.maxDoubleShiftInterval {
+            // Слишком долго, начинаем заново
+            shiftPressCount = 1
             lastShiftPressTime = currentTime
-            print("📝 Первое нажатие Shift в последовательности")
-        } else if shiftPressCount == 2 {
-            // Второе нажатие - проверяем интервал
-            let timeDiff = currentTime - lastShiftPressTime
-            
-            print("⚙️ Настройки: мин=\(String(format: "%.3f", settings.minDoubleShiftInterval))s, макс=\(String(format: "%.3f", settings.maxDoubleShiftInterval))s")
-            print("⏱️ Интервал между нажатиями: \(String(format: "%.3f", timeDiff))s")
-            
-            if timeDiff >= settings.minDoubleShiftInterval && timeDiff <= settings.maxDoubleShiftInterval {
-                print("🔥 ДВОЙНОЕ НАЖАТИЕ SHIFT ОБНАРУЖЕНО! Интервал: \(String(format: "%.3f", timeDiff))s")
-                
-                // Выполняем переключение
-                DispatchQueue.main.async { [weak self] in
-                    self?.switchLayout()
-                }
-                
-                // Полный сброс состояния
-                shiftPressCount = 0
-                isShiftSequenceActive = false
-                lastShiftPressTime = 0
-                lastShiftReleaseTime = 0
-            } else {
-                if timeDiff < settings.minDoubleShiftInterval {
-                    print("⚠️ Слишком быстрое второе нажатие: \(String(format: "%.3f", timeDiff))s < \(String(format: "%.3f", settings.minDoubleShiftInterval))s")
-                } else {
-                    print("⏰ Слишком долгий интервал для второго нажатия: \(String(format: "%.3f", timeDiff))s > \(String(format: "%.3f", settings.maxDoubleShiftInterval))s")
-                }
-                
-                // Начинаем новую последовательность
-                shiftPressCount = 1
-                lastShiftPressTime = currentTime
-            }
-        } else if shiftPressCount > 2 {
-            // Больше двух нажатий - игнорируем и ждем отпускания
-            print("🚫 Игнорируем лишнее нажатие #\(shiftPressCount)")
-            // Не обновляем lastShiftPressTime, чтобы сохранить возможность двойного нажатия
+            print("⏰ Таймаут, начинаем заново (интервал: \(String(format: "%.0f", timeSinceLastPress * 1000))ms)")
+            return
         }
+        
+        // Увеличиваем счетчик
+        shiftPressCount += 1
+        
+        if shiftPressCount == 2 {
+            // Второе нажатие в правильном интервале!
+            print("🟢 Shift #2 - ДВОЙНОЕ НАЖАТИЕ! (интервал: \(String(format: "%.0f", timeSinceLastPress * 1000))ms)")
+            
+            // Выполняем переключение
+            DispatchQueue.main.async { [weak self] in
+                self?.switchLayout()
+            }
+            
+            // Сбрасываем состояние
+            shiftPressCount = 0
+            isShiftSequenceActive = false
+            lastShiftPressTime = 0
+        } else {
+            // Больше двух нажатий
+            print("🔴 Shift #\(shiftPressCount) - слишком много нажатий, сбрасываем")
+            shiftPressCount = 0
+            isShiftSequenceActive = false
+        }
+        
+        lastShiftPressTime = currentTime
     }
     
     private func handleShiftRelease() {
         let currentTime = Date().timeIntervalSince1970
         lastShiftReleaseTime = currentTime
         
-        print("📤 Shift отпущен. Счетчик: \(shiftPressCount), активна последовательность: \(isShiftSequenceActive)")
-        
-        // Если было больше 2 нажатий, сбрасываем состояние
-        if shiftPressCount > 2 {
-            print("🔄 Сброс после множественных нажатий")
-            shiftPressCount = 0
-            isShiftSequenceActive = false
-            lastShiftPressTime = 0
-            return
-        }
-        
-        // Запускаем таймер сброса, если последовательность не завершена
-        if isShiftSequenceActive && shiftPressCount > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + settings.maxDoubleShiftInterval + 0.1) { [weak self] in
-                guard let self = self else { return }
-                
-                // Сбрасываем счетчик если за максимальное время не было второго нажатия
-                if self.isShiftSequenceActive && self.shiftPressCount == 1 {
-                    print("⏳ Время вышло, сбрасываем счетчик нажатий")
-                    self.shiftPressCount = 0
-                    self.isShiftSequenceActive = false
-                    self.lastShiftPressTime = 0
-                }
-            }
-        }
+        // Просто фиксируем отпускание, основная логика в handleShiftPress
+        print("🔻 Shift отпущен")
     }
     
     // Тестовый метод для проверки двойного Shift
@@ -694,11 +658,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         
         // Получаем выделенный текст
         guard let selectedText = getSelectedText() else {
+            print("❌ Текст не выделен")
             playErrorSound()
             return
         }
         
         print("📝 Выделенный текст: '\(selectedText)'")
+        
+        // Определяем язык текста для переключения раскладки
+        let isRussianText = detectIfRussianText(selectedText)
         
         // Конвертируем текст
         let convertedText = convertLayout(selectedText)
@@ -707,8 +675,54 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // Заменяем выделенный текст
         replaceSelectedText(with: convertedText)
         
+        // Переключаем раскладку клавиатуры
+        switchKeyboardLayout(toRussian: !isRussianText)
+        
         // Играем звук успеха
         playSuccessSound()
+    }
+    
+    // Определяем, является ли текст русским
+    private func detectIfRussianText(_ text: String) -> Bool {
+        let lowercaseText = text.lowercased()
+        var rusCount = 0
+        var engCount = 0
+        
+        for char in lowercaseText {
+            if rusToEng.keys.contains(char) {
+                rusCount += 1
+            } else if engToRus.keys.contains(char) {
+                engCount += 1
+            }
+        }
+        
+        return rusCount > engCount
+    }
+    
+    // Переключаем раскладку клавиатуры
+    private func switchKeyboardLayout(toRussian: Bool) {
+        // Получаем список источников ввода
+        guard let inputSources = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] else {
+            print("❌ Не удалось получить список источников ввода")
+            return
+        }
+        
+        // Ищем нужную раскладку
+        for inputSource in inputSources {
+            guard let sourceID = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID) else { continue }
+            let sourceIDString = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
+            
+            // Проверяем ID раскладки
+            if toRussian && sourceIDString.contains("Russian") {
+                TISSelectInputSource(inputSource)
+                print("✅ Переключено на русскую раскладку")
+                break
+            } else if !toRussian && (sourceIDString.contains("U.S.") || sourceIDString.contains("ABC")) {
+                TISSelectInputSource(inputSource)
+                print("✅ Переключено на английскую раскладку")
+                break
+            }
+        }
     }
     
     // Звуковые эффекты
@@ -766,7 +780,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     
     func getSelectedText() -> String? {
         let pasteboard = NSPasteboard.general
+        
+        // Сохраняем оригинальное содержимое буфера
+        let originalChangeCount = pasteboard.changeCount
         let originalContents = pasteboard.string(forType: .string)
+        
+        // Очищаем буфер перед копированием
+        pasteboard.clearContents()
         
         // Симулируем Cmd+C
         let source = CGEventSource(stateID: .hidSystemState)
@@ -790,6 +810,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         
         // Задержка для завершения копирования
         usleep(100000) // 100ms
+        
+        // Проверяем, изменился ли буфер обмена
+        let newChangeCount = pasteboard.changeCount
+        
+        if newChangeCount == originalChangeCount {
+            // Буфер не изменился - значит ничего не было выделено
+            print("⚠️ Ничего не выделено")
+            // Восстанавливаем оригинальное содержимое если было
+            if let original = originalContents {
+                pasteboard.clearContents()
+                pasteboard.setString(original, forType: .string)
+            }
+            return nil
+        }
         
         let copiedText = pasteboard.string(forType: .string)
         
