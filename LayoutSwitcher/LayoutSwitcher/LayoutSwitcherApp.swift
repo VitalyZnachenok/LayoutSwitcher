@@ -234,6 +234,13 @@ final class ClipboardManager {
             throw LayoutError.noTextSelected
         }
         
+        // Check if the copied text is different from original clipboard
+        // This helps detect if text was actually selected vs whole line copied
+        if copiedText == originalString {
+            Logger.clipboard.warning("Copied text same as original clipboard - likely no selection")
+            throw LayoutError.noTextSelected
+        }
+        
         Logger.clipboard.debug("Got text: \(copiedText.prefix(50))...")
         
         // Store original clipboard for later restoration
@@ -384,14 +391,51 @@ final class HotKeyManager: ObservableObject {
     private func setupShiftMonitoring() {
         Logger.hotkeys.info("Setting up double shift monitoring")
         
+        // Reset all shift state
+        lastShiftPressTime = 0
+        shiftPressCount = 0
+        
         shiftMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             guard let self = self else { return }
             
-            if event.modifierFlags.contains(.shift) {
-                Task { @MainActor in
-                    await self.handleShiftPress()
-                }
+            Task { @MainActor in
+                await self.handleShiftEvent(event)
             }
+        }
+        
+        // Also monitor local events for better detection
+        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self = self else { return event }
+            
+            Task { @MainActor in
+                await self.handleShiftEvent(event)
+            }
+            
+            return event
+        }
+    }
+    
+    private func handleShiftEvent(_ event: NSEvent) async {
+        let hasShift = event.modifierFlags.contains(.shift)
+        let hasOnlyShift = event.modifierFlags.intersection([.command, .option, .control]).isEmpty
+        
+        // Only process if ONLY shift is pressed (no other modifiers)
+        guard hasOnlyShift else {
+            // Reset count if other modifiers are pressed
+            if !event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
+                shiftPressCount = 0
+                lastShiftPressTime = 0
+                Logger.hotkeys.debug("Reset shift count due to other modifiers")
+            }
+            return
+        }
+        
+        if hasShift {
+            // Shift pressed
+            await handleShiftPress()
+        } else {
+            // Shift released - important for detecting separate presses
+            Logger.hotkeys.debug("Shift released")
         }
     }
     
@@ -399,27 +443,44 @@ final class HotKeyManager: ObservableObject {
         let currentTime = Date.timeIntervalSinceReferenceDate
         let config = settings.configuration
         
-        defer { lastShiftPressTime = currentTime }
+        // Calculate time since last press
+        let timeSinceLastPress = lastShiftPressTime > 0 ? currentTime - lastShiftPressTime : Double.infinity
         
-        let timeSinceLastPress = currentTime - lastShiftPressTime
+        Logger.hotkeys.debug("Shift press: count=\(self.shiftPressCount), timeSince=\(String(format: "%.0f", timeSinceLastPress * 1000))ms")
         
-        if timeSinceLastPress < config.minDoubleShiftInterval {
-            Logger.hotkeys.debug("Shift press too fast, ignoring")
-            return
-        }
-        
+        // Check if this is a new sequence or continuation
         if timeSinceLastPress > config.maxDoubleShiftInterval {
+            // Too long, start new sequence
             shiftPressCount = 1
-            Logger.hotkeys.debug("Shift press timeout, restarting count")
+            lastShiftPressTime = currentTime
+            Logger.hotkeys.debug("Starting new shift sequence (timeout)")
+        } else if timeSinceLastPress < config.minDoubleShiftInterval {
+            // Too fast, might be key repeat - ignore
+            Logger.hotkeys.debug("Ignoring - too fast (possible key repeat)")
             return
-        }
-        
-        shiftPressCount += 1
-        
-        if shiftPressCount == 2 {
-            Logger.hotkeys.info("Double shift detected, converting layout")
-            shiftPressCount = 0
-            await convertLayout()
+        } else {
+            // Valid timing for double shift
+            shiftPressCount += 1
+            
+            if shiftPressCount == 2 {
+                Logger.hotkeys.info("Double shift detected! Converting layout...")
+                // Reset immediately to prevent triple+ triggers
+                shiftPressCount = 0
+                lastShiftPressTime = 0
+                
+                // Add small delay to let user release shift before conversion
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                
+                // Perform conversion
+                await convertLayout()
+            } else if shiftPressCount > 2 {
+                // Reset if somehow we got more than 2
+                shiftPressCount = 0
+                lastShiftPressTime = 0
+            } else {
+                // First press in valid sequence
+                lastShiftPressTime = currentTime
+            }
         }
     }
     
@@ -438,7 +499,21 @@ final class HotKeyManager: ObservableObject {
                 
                 let manager = Unmanaged<HotKeyManager>.fromOpaque(refcon).takeUnretainedValue()
                 
+                // Check if this is our hotkey
                 if manager.shouldHandleEvent(event) {
+                    // Additional check: ignore if arrow keys or navigation keys are involved
+                    let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+                    let navigationKeys: Set<UInt16> = [
+                        123, 124, 125, 126,  // Arrow keys
+                        115, 116, 119, 121,  // Home, End, Page Up, Page Down
+                        96, 97, 98, 99, 100, 101  // F-keys that might be used for navigation
+                    ]
+                    
+                    if navigationKeys.contains(keyCode) {
+                        Logger.hotkeys.debug("Ignoring hotkey with navigation key")
+                        return Unmanaged.passUnretained(event)
+                    }
+                    
                     Task { @MainActor in
                         await manager.convertLayout()
                     }
@@ -472,16 +547,44 @@ final class HotKeyManager: ObservableObject {
     }
     
     func convertLayout() async {
+        // Add a small delay to ensure selection is complete
+        // This helps prevent issues with Shift+Arrow combinations
+        try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        
+        // Check if Shift is still pressed (might be selecting text)
+        let currentModifiers = NSEvent.modifierFlags
+        if currentModifiers.contains(.shift) &&
+           !settings.configuration.useDoubleShift {
+            Logger.conversion.warning("Shift still pressed, might be selecting text - aborting")
+            return
+        }
+        
+        // Additional check for arrow keys being pressed
+        if currentModifiers.contains(.function) {
+            Logger.conversion.warning("Function/Arrow key detected - aborting conversion")
+            return
+        }
+        
         do {
             Logger.conversion.info("Starting layout conversion...")
             
-            // Get selected text
+            // Get selected text - this will throw if no text is selected
             let originalText = try await clipboard.getSelectedText()
             
             guard !originalText.isEmpty else {
                 Logger.conversion.warning("Selected text is empty")
                 throw LayoutError.noTextSelected
             }
+            
+            // Check if text looks like it was auto-selected (whole line/paragraph)
+            // This helps prevent converting when cursor is just on a line
+            if originalText.contains("\n") || originalText.count > 200 {
+                Logger.conversion.warning("Text appears to be auto-selected (contains newlines or very long) - aborting")
+                return
+            }
+            
+            // Detect original language
+            let wasRussian = converter.detectLanguage(originalText)
             
             // Convert the text
             let convertedText = converter.convert(originalText)
@@ -496,26 +599,27 @@ final class HotKeyManager: ObservableObject {
                 
                 if forcedText == originalText {
                     Logger.conversion.error("Text cannot be converted - may not contain convertible characters")
-                    await playErrorSound()
+                    // Don't play error sound for unconvertible text
                     return
                 }
                 
                 try await clipboard.replaceSelectedText(with: forcedText)
+                // Switch to opposite layout since we forced conversion
+                await switchKeyboardLayout(toRussian: !wasRussian)
             } else {
                 // Replace with converted text
                 try await clipboard.replaceSelectedText(with: convertedText)
+                // Switch keyboard to match the NEW text language
+                let convertedIsRussian = converter.detectLanguage(convertedText)
+                await switchKeyboardLayout(toRussian: convertedIsRussian)
             }
-            
-            // Switch keyboard layout based on original text
-            let wasRussian = converter.detectLanguage(originalText)
-            await switchKeyboardLayout(toRussian: !wasRussian)
             
             await playSuccessSound()
             Logger.conversion.info("Layout conversion completed successfully")
             
         } catch LayoutError.noTextSelected {
             Logger.conversion.warning("No text selected")
-            await playErrorSound()
+            // Don't play error sound for no selection - this is often intentional
         } catch {
             Logger.conversion.error("Conversion failed: \(error.localizedDescription)")
             await playErrorSound()
@@ -538,22 +642,131 @@ final class HotKeyManager: ObservableObject {
     }
     
     private func switchKeyboardLayout(toRussian: Bool) async {
-        // Исправлено: добавлен правильный импорт и типы
         guard let inputSources = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] else {
+            Logger.conversion.error("Failed to get input source list")
             return
         }
         
+        // Debug: List all available layouts
+        Logger.conversion.debug("Switching to \(toRussian ? "Russian" : "English") layout")
+        Logger.conversion.debug("Available keyboard layouts:")
+        for inputSource in inputSources {
+            if let sourceID = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID) {
+                let sourceIDString = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
+                Logger.conversion.debug("  - \(sourceIDString)")
+            }
+        }
+        
+        // Try to find and switch to the requested layout
         for inputSource in inputSources {
             guard let sourceID = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID) else { continue }
             let sourceIDString = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
             
-            if (toRussian && sourceIDString.contains("Russian")) ||
-               (!toRussian && (sourceIDString.contains("U.S.") || sourceIDString.contains("ABC"))) {
-                TISSelectInputSource(inputSource)
-                Logger.conversion.debug("Switched keyboard to \(toRussian ? "Russian" : "English")")
-                break
+            // Skip non-keyboard sources
+            guard !sourceIDString.contains(".SCIM") &&
+                  !sourceIDString.contains("Emoji") &&
+                  !sourceIDString.contains("Dictation") else { continue }
+            
+            let sourceIDLower = sourceIDString.lowercased()
+            
+            if toRussian {
+                // Looking for Russian layout
+                let isRussianLayout = sourceIDLower.contains("russian") ||
+                                      sourceIDLower.contains("cyrillic")
+                
+                if isRussianLayout {
+                    TISSelectInputSource(inputSource)
+                    Logger.conversion.info("✅ Switched to Russian layout: \(sourceIDString)")
+                    return
+                }
+            } else {
+                // Looking for English layout - IMPORTANT: exclude Russian layouts first
+                let isRussianLayout = sourceIDLower.contains("russian") ||
+                                      sourceIDLower.contains("cyrillic")
+                
+                // Skip if this is a Russian layout
+                if isRussianLayout {
+                    continue
+                }
+                
+                // Check if this is an English layout
+                let isEnglishLayout = sourceIDString == "com.apple.keylayout.US" ||
+                                      sourceIDString == "com.apple.keylayout.ABC" ||
+                                      sourceIDString == "com.apple.keylayout.USExtended" ||
+                                      sourceIDString == "com.apple.keylayout.USInternational-PC" ||
+                                      sourceIDString == "com.apple.keylayout.British" ||
+                                      sourceIDString == "com.apple.keylayout.Canadian" ||
+                                      sourceIDString == "com.apple.keylayout.Australian" ||
+                                      sourceIDString == "com.apple.keylayout.Irish" ||
+                                      sourceIDLower.contains("u.s") ||
+                                      sourceIDLower.contains(".us") ||
+                                      sourceIDLower.contains("abc") ||
+                                      sourceIDLower.contains("british") ||
+                                      sourceIDLower.contains("english")
+                
+                if isEnglishLayout {
+                    TISSelectInputSource(inputSource)
+                    Logger.conversion.info("✅ Switched to English layout: \(sourceIDString)")
+                    return
+                }
             }
         }
+        
+        // If we didn't find the specific layout, try fallback for English
+        if !toRussian {
+            Logger.conversion.warning("⚠️ Specific English layout not found, trying fallback")
+            
+            for inputSource in inputSources {
+                guard let sourceID = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID) else { continue }
+                let sourceIDString = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
+                let sourceIDLower = sourceIDString.lowercased()
+                
+                // Use any non-Russian keyboard layout as fallback
+                if sourceIDString.contains("com.apple.keylayout") &&
+                   !sourceIDLower.contains("russian") &&
+                   !sourceIDLower.contains("cyrillic") &&
+                   !sourceIDString.contains("Emoji") &&
+                   !sourceIDString.contains("Dictation") {
+                    TISSelectInputSource(inputSource)
+                    Logger.conversion.info("✅ Fallback: Switched to layout: \(sourceIDString)")
+                    return
+                }
+            }
+        }
+        
+        Logger.conversion.error("❌ Could not find \(toRussian ? "Russian" : "English") keyboard layout")
+    }
+    
+    // Helper method to list available layouts
+    func listAvailableLayouts() async {
+        guard let inputSources = TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] else {
+            Logger.conversion.error("Failed to get input source list")
+            return
+        }
+        
+        var layoutList: [String] = []
+        
+        Logger.conversion.info("📋 Available Keyboard Layouts:")
+        
+        for inputSource in inputSources {
+            if let sourceID = TISGetInputSourceProperty(inputSource, kTISPropertyInputSourceID) {
+                let sourceIDString = Unmanaged<CFString>.fromOpaque(sourceID).takeUnretainedValue() as String
+                
+                // Skip non-keyboard sources
+                if !sourceIDString.contains("Emoji") && !sourceIDString.contains("Dictation") {
+                    layoutList.append(sourceIDString)
+                    Logger.conversion.info("  • \(sourceIDString)")
+                }
+            }
+        }
+        
+        // Also show in an alert for easy viewing
+        let alert = NSAlert()
+        alert.messageText = "Доступные раскладки клавиатуры"
+        alert.informativeText = layoutList.joined(separator: "\n• ")
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
     
     private func playSuccessSound() async {
@@ -641,6 +854,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ","
         ))
         
+        // Debug menu item to show available keyboards
+        menu.addItem(NSMenuItem(
+            title: "Показать доступные раскладки",
+            action: #selector(showAvailableLayouts),
+            keyEquivalent: ""
+        ))
+        
         if !hasPermissions {
             menu.addItem(NSMenuItem(
                 title: "Предоставить разрешения...",
@@ -667,6 +887,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Clean up menu after showing (important for click-through behavior)
         DispatchQueue.main.async { [weak self] in
             self?.statusItem?.menu = nil
+        }
+    }
+    
+    @objc private func showAvailableLayouts() {
+        Task {
+            await hotKeyManager?.listAvailableLayouts()
         }
     }
     
