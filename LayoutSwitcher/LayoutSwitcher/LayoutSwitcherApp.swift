@@ -299,6 +299,55 @@ final class SettingsManager: ObservableObject {
 // MARK: - Notification Names
 extension Notification.Name {
     static let hotKeyConfigurationChanged = Notification.Name("hotKeyConfigurationChanged")
+    static let accessibilityStatusChanged = Notification.Name("accessibilityStatusChanged")
+}
+
+// MARK: - Key Codes Constants
+/// Константы для виртуальных кодов клавиш (избегаем magic numbers)
+private enum KeyCode {
+    static let c: UInt16 = 0x08        // Клавиша C (для Cmd+C)
+    static let v: UInt16 = 0x09        // Клавиша V (для Cmd+V)
+    static let l: UInt16 = 0x25        // Клавиша L (дефолтная горячая клавиша)
+    static let leftShift: UInt16 = 0x38   // Левый Shift
+    static let rightShift: UInt16 = 0x3C  // Правый Shift
+}
+
+// MARK: - Timing Constants
+/// Константы для задержек (в наносекундах)
+private enum Timing {
+    static let copyDelay: UInt64 = 150_000_000       // 150ms - ожидание после копирования
+    static let pasteDelay: UInt64 = 50_000_000       // 50ms - задержка перед вставкой
+    static let restoreDelay: UInt64 = 100_000_000    // 100ms - задержка перед восстановлением буфера
+    static let keyPressDelay: UInt64 = 10_000_000    // 10ms - задержка между keyDown и keyUp
+    static let doubleShiftDelay: UInt64 = 100_000_000 // 100ms - задержка после двойного Shift
+}
+
+// MARK: - Clipboard Helper
+/// Структура для сохранения и восстановления содержимого буфера обмена
+private struct ClipboardState {
+    let changeCount: Int
+    let stringContent: String?
+    let dataContent: Data?
+    
+    init(pasteboard: NSPasteboard) {
+        self.changeCount = pasteboard.changeCount
+        self.stringContent = pasteboard.string(forType: .string)
+        self.dataContent = pasteboard.data(forType: .string)
+    }
+    
+    /// Восстанавливает содержимое буфера обмена
+    func restore(to pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        if let data = dataContent {
+            pasteboard.setData(data, forType: .string)
+            Logger.conversion.debug("Restored clipboard content (data)")
+        } else if let string = stringContent {
+            pasteboard.setString(string, forType: .string)
+            Logger.conversion.debug("Restored clipboard content (string)")
+        } else {
+            Logger.conversion.debug("Cleared clipboard (was empty)")
+        }
+    }
 }
 
 // MARK: - Layout Converter
@@ -319,6 +368,10 @@ final class LayoutConverter {
     lazy var engToRus: [Character: Character] = {
         Dictionary(uniqueKeysWithValues: Self.rusToEngMappings.compactMap { ($1, $0) })
     }()
+    
+    // Оптимизация: Set для O(1) поиска вместо O(n) в keys
+    private lazy var russianCharSet: Set<Character> = Set(rusToEng.keys)
+    private lazy var englishCharSet: Set<Character> = Set(engToRus.keys)
     
     private let conversionCache = NSCache<NSString, NSString>()
     
@@ -353,10 +406,11 @@ final class LayoutConverter {
         var rusCount = 0
         var engCount = 0
         
+        // Оптимизация: использование Set вместо Dictionary.keys для O(1) поиска
         for char in lowercased {
-            if rusToEng.keys.contains(char) {
+            if russianCharSet.contains(char) {
                 rusCount += 1
-            } else if engToRus.keys.contains(char) {
+            } else if englishCharSet.contains(char) {
                 engCount += 1
             }
         }
@@ -376,8 +430,13 @@ final class HotKeyManager: ObservableObject {
     private var runLoopSource: CFRunLoopSource?
     
     // Use UInt64 (raw value) instead of CGEventFlags as dictionary key
-    private var lastModifierPressTime: [UInt64: TimeInterval] = [:]
-    private var modifierPressCount: [UInt64: Int] = [:]
+    // nonisolated(unsafe) потому что доступ из event tap callback (другой поток)
+    private nonisolated(unsafe) var lastModifierPressTime: [UInt64: TimeInterval] = [:]
+    private nonisolated(unsafe) var modifierPressCount: [UInt64: Int] = [:]
+    
+    // Debounce для комбинаций клавиш (Ctrl+Shift, Fn+Shift)
+    private nonisolated(unsafe) var lastComboTriggerTime: TimeInterval = 0
+    private let comboDebounceInterval: TimeInterval = 0.5
     
     private let settings: SettingsManager
     private let converter = LayoutConverter()
@@ -385,12 +444,34 @@ final class HotKeyManager: ObservableObject {
     
     private var cancellables = Set<AnyCancellable>()
     private var accessibilityCheckTimer: Timer?
+    private var lastAccessibilityStatus: Bool = false
+    
+    // КРИТИЧНО: Кэшируем конфигурацию для безопасного доступа из callback
+    // Event tap callback выполняется НЕ на main thread!
+    private nonisolated(unsafe) var cachedHotKeyMode: HotKeyMode = .customHotkey
+    private nonisolated(unsafe) var cachedKeyCode: UInt16 = 0x25
+    private nonisolated(unsafe) var cachedModifierFlags: UInt = 0
+    private nonisolated(unsafe) var cachedMinInterval: TimeInterval = 0.05
+    private nonisolated(unsafe) var cachedMaxInterval: TimeInterval = 0.8
     
     init(settings: SettingsManager) {
         self.settings = settings
+        lastAccessibilityStatus = AXIsProcessTrusted()
+        updateCachedConfiguration()
         setupConfigurationObserver()
         setupAccessibilityMonitoring()
         setupEventTap()
+    }
+    
+    /// Обновляет кэшированную конфигурацию (вызывается на main thread)
+    private func updateCachedConfiguration() {
+        let config = settings.configuration
+        cachedHotKeyMode = config.hotKeyMode
+        cachedKeyCode = config.keyCode
+        cachedModifierFlags = config.modifierFlags
+        cachedMinInterval = config.minDoubleShiftInterval
+        cachedMaxInterval = config.maxDoubleShiftInterval
+        Logger.hotkeys.debug("Configuration cached: mode=\(self.cachedHotKeyMode.rawValue)")
     }
     
     deinit {
@@ -409,17 +490,24 @@ final class HotKeyManager: ObservableObject {
     }
     
     private func setupAccessibilityMonitoring() {
-        // Проверяем права каждые 2 секунды
-        accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // Оптимизация: проверяем права каждые 5 секунд вместо 2,
+        // и только при изменении статуса выполняем действия
+        accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             
             let hasAccess = AXIsProcessTrusted()
+            
+            // Оптимизация: проверяем изменение статуса, чтобы не делать лишнюю работу
+            guard hasAccess != self.lastAccessibilityStatus else { return }
+            self.lastAccessibilityStatus = hasAccess
             
             // Если права появились и event tap ещё не создан
             if hasAccess && self.eventTap == nil {
                 Logger.hotkeys.info("✅ Accessibility permissions granted - setting up event tap")
                 Task { @MainActor in
                     self.setupEventTap()
+                    // Уведомляем AppDelegate об изменении статуса
+                    NotificationCenter.default.post(name: .accessibilityStatusChanged, object: nil)
                 }
             }
             // Если права отозваны и event tap существует
@@ -436,6 +524,8 @@ final class HotKeyManager: ObservableObject {
                         CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
                         self.runLoopSource = nil
                     }
+                    // Уведомляем AppDelegate об изменении статуса
+                    NotificationCenter.default.post(name: .accessibilityStatusChanged, object: nil)
                 }
             }
         }
@@ -446,8 +536,11 @@ final class HotKeyManager: ObservableObject {
             .publisher(for: .hotKeyConfigurationChanged)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
-                // Extract configuration from notification if needed
-                self?.setupEventTap()
+                guard let self = self else { return }
+                // Обновляем кэш конфигурации
+                self.updateCachedConfiguration()
+                // Пересоздаём event tap с новыми настройками
+                self.setupEventTap()
             }
             .store(in: &cancellables)
     }
@@ -474,12 +567,22 @@ final class HotKeyManager: ObservableObject {
         let eventMask = (1 << CGEventType.keyDown.rawValue) |
                         (1 << CGEventType.flagsChanged.rawValue)
         
+        // ВАЖНО: Используем .listenOnly для безопасности!
+        // Это гарантирует, что события ВСЕГДА проходят к системе,
+        // даже если в нашем коде произойдёт ошибка.
+        // Недостаток: для customHotkey символ будет вводиться (можно стереть потом).
+        let currentMode = cachedHotKeyMode
+        let tapOptions: CGEventTapOptions = currentMode == .customHotkey
+            ? .defaultTap  // Для customHotkey нужно блокировать символ
+            : .listenOnly  // Для остальных режимов - только слушаем (безопасно)
+        
         guard let eventTap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .defaultTap,
+            options: tapOptions,
             eventsOfInterest: CGEventMask(eventMask),
             callback: { proxy, type, event, refcon in
+                // КРИТИЧНО: Всегда пропускаем событие при любой ошибке
                 guard let refcon = refcon else {
                     return Unmanaged.passUnretained(event)
                 }
@@ -487,10 +590,30 @@ final class HotKeyManager: ObservableObject {
                 let manager = Unmanaged<HotKeyManager>.fromOpaque(refcon)
                     .takeUnretainedValue()
                 
-                if manager.handleEvent(event, type: type) {
+                // Защита от системных событий (tap disabled и т.д.)
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    // Переактивируем tap если он был отключён системой
+                    if let tap = manager.eventTap {
+                        CGEvent.tapEnable(tap: tap, enable: true)
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                
+                // Обрабатываем только keyDown и flagsChanged
+                guard type == .keyDown || type == .flagsChanged else {
+                    return Unmanaged.passUnretained(event)
+                }
+                
+                // КРИТИЧНО: Используем ТОЛЬКО кэшированные значения!
+                // НЕ обращаемся к settings - это вызовет deadlock!
+                let shouldBlock = manager.handleEventFromCallback(event, type: type)
+                
+                // Блокируем событие только для customHotkey режима
+                if shouldBlock && manager.cachedHotKeyMode == .customHotkey {
                     return nil
                 }
                 
+                // Для всех остальных случаев - ВСЕГДА пропускаем событие
                 return Unmanaged.passUnretained(event)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
@@ -505,7 +628,22 @@ final class HotKeyManager: ObservableObject {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
         
-        Logger.hotkeys.info("✅ Event tap created for mode: \(self.settings.configuration.hotKeyMode.rawValue)")
+        Logger.hotkeys.info("✅ Event tap created for mode: \(currentMode.rawValue), options: \(tapOptions == .listenOnly ? "listenOnly" : "defaultTap")")
+    }
+    
+    /// Обработчик событий для вызова из callback (nonisolated, thread-safe)
+    /// КРИТИЧНО: Не обращается к @MainActor свойствам напрямую!
+    nonisolated func handleEventFromCallback(_ event: CGEvent, type: CGEventType) -> Bool {
+        switch cachedHotKeyMode {
+        case .customHotkey:
+            return handleCustomHotkeyFromCallback(event, type: type)
+        case .doubleShift:
+            return handleDoubleModifierFromCallback(event, type: type, targetFlag: .maskShift, keyCodes: [KeyCode.leftShift, KeyCode.rightShift])
+        case .ctrlShift:
+            return handleCtrlShiftFromCallback(event, type: type)
+        case .fnShift:
+            return handleFnShiftFromCallback(event, type: type)
+        }
     }
     
     private func handleEvent(_ event: CGEvent, type: CGEventType) -> Bool {
@@ -515,13 +653,153 @@ final class HotKeyManager: ObservableObject {
         case .customHotkey:
             return handleCustomHotkey(event, type: type)
         case .doubleShift:
-            return handleDoubleModifier(event, type: type, targetFlag: .maskShift, keyCodes: [0x38, 0x3C])
+            return handleDoubleModifier(event, type: type, targetFlag: .maskShift, keyCodes: [KeyCode.leftShift, KeyCode.rightShift])
         case .ctrlShift:
             return handleCtrlShift(event, type: type)
         case .fnShift:
             return handleFnShift(event, type: type)
         }
     }
+    
+    // MARK: - Thread-safe handlers (для вызова из event tap callback)
+    // Эти методы используют ТОЛЬКО кэшированные значения, не обращаются к @MainActor
+    
+    nonisolated private func handleCustomHotkeyFromCallback(_ event: CGEvent, type: CGEventType) -> Bool {
+        guard type == .keyDown else { return false }
+        
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        let flags = event.flags
+        
+        let expectedFlags = CGEventFlags(rawValue: UInt64(cachedModifierFlags))
+        
+        if keyCode == cachedKeyCode && flags.contains(expectedFlags) {
+            Logger.hotkeys.info("Custom hotkey triggered")
+            Task { @MainActor in
+                await self.convertLayout()
+            }
+            return true
+        }
+        
+        return false
+    }
+    
+    nonisolated private func handleDoubleModifierFromCallback(
+        _ event: CGEvent,
+        type: CGEventType,
+        targetFlag: CGEventFlags,
+        keyCodes: [UInt16]
+    ) -> Bool {
+        guard type == .flagsChanged else { return false }
+        
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        guard keyCodes.contains(keyCode) else { return false }
+        
+        let flags = event.flags
+        let hasTargetFlag = flags.contains(targetFlag)
+        
+        var otherModifiers: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl]
+        if targetFlag != .maskShift {
+            otherModifiers.insert(.maskShift)
+        }
+        
+        let hasOtherModifiers = !flags.intersection(otherModifiers).isEmpty
+        let flagKey = targetFlag.rawValue
+        
+        if hasOtherModifiers {
+            modifierPressCount[flagKey] = 0
+            lastModifierPressTime[flagKey] = 0
+            return false
+        }
+        
+        if hasTargetFlag {
+            return handleModifierPressFromCallback(targetFlag: targetFlag)
+        }
+        
+        return false
+    }
+    
+    nonisolated private func handleModifierPressFromCallback(targetFlag: CGEventFlags) -> Bool {
+        let currentTime = Date.timeIntervalSinceReferenceDate
+        let flagKey = targetFlag.rawValue
+        
+        let lastTime = lastModifierPressTime[flagKey] ?? 0
+        let count = modifierPressCount[flagKey] ?? 0
+        let timeSinceLastPress = lastTime > 0 ? currentTime - lastTime : Double.infinity
+        
+        if timeSinceLastPress > cachedMaxInterval {
+            modifierPressCount[flagKey] = 1
+            lastModifierPressTime[flagKey] = currentTime
+        } else if timeSinceLastPress < cachedMinInterval {
+            return false
+        } else {
+            modifierPressCount[flagKey] = count + 1
+            
+            if modifierPressCount[flagKey] == 2 {
+                Logger.hotkeys.info("Double press detected!")
+                modifierPressCount[flagKey] = 0
+                lastModifierPressTime[flagKey] = 0
+                
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: Timing.doubleShiftDelay)
+                    await self.convertLayout()
+                }
+            } else {
+                lastModifierPressTime[flagKey] = currentTime
+            }
+        }
+        
+        return false
+    }
+    
+    nonisolated private func handleCtrlShiftFromCallback(_ event: CGEvent, type: CGEventType) -> Bool {
+        guard type == .flagsChanged else { return false }
+        
+        let flags = event.flags
+        let hasCtrl = flags.contains(.maskControl)
+        let hasShift = flags.contains(.maskShift)
+        let hasOthers = flags.contains(.maskCommand) || flags.contains(.maskAlternate)
+        
+        if hasCtrl && hasShift && !hasOthers {
+            let now = Date.timeIntervalSinceReferenceDate
+            guard now - lastComboTriggerTime > comboDebounceInterval else {
+                return false
+            }
+            lastComboTriggerTime = now
+            
+            Logger.hotkeys.info("✅ Ctrl+Shift detected!")
+            Task { @MainActor in
+                await self.convertLayout()
+            }
+        }
+        
+        return false
+    }
+    
+    nonisolated private func handleFnShiftFromCallback(_ event: CGEvent, type: CGEventType) -> Bool {
+        guard type == .flagsChanged else { return false }
+        
+        let flags = event.flags
+        let hasFn = flags.contains(.maskSecondaryFn)
+        let hasShift = flags.contains(.maskShift)
+        let hasOthers = flags.contains(.maskCommand) || flags.contains(.maskAlternate) || flags.contains(.maskControl)
+        
+        if hasFn && hasShift && !hasOthers {
+            let now = Date.timeIntervalSinceReferenceDate
+            guard now - lastComboTriggerTime > comboDebounceInterval else {
+                return false
+            }
+            lastComboTriggerTime = now
+            
+            Logger.hotkeys.info("✅ Fn+Shift detected!")
+            Task { @MainActor in
+                await self.convertLayout()
+            }
+        }
+        
+        return false
+    }
+    
+    // MARK: - MainActor handlers (для прямого вызова)
     
     private func handleCustomHotkey(_ event: CGEvent, type: CGEventType) -> Bool {
         guard type == .keyDown else { return false }
@@ -611,11 +889,9 @@ final class HotKeyManager: ObservableObject {
                 lastModifierPressTime[flagKey] = 0
                 
                 Task {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    try? await Task.sleep(nanoseconds: Timing.doubleShiftDelay)
                     await self.convertLayout()
                 }
-                
-                return true
             } else {
                 lastModifierPressTime[flagKey] = currentTime
             }
@@ -637,9 +913,16 @@ final class HotKeyManager: ObservableObject {
         Logger.hotkeys.debug("Ctrl: \(hasCtrl), Shift: \(hasShift), Others: \(hasOthers)")
         
         if hasCtrl && hasShift && !hasOthers {
+            // Debounce: предотвращаем многократное срабатывание при удержании
+            let now = Date.timeIntervalSinceReferenceDate
+            guard now - lastComboTriggerTime > comboDebounceInterval else {
+                Logger.hotkeys.debug("Ctrl+Shift debounced")
+                return false
+            }
+            lastComboTriggerTime = now
+            
             Logger.hotkeys.info("✅ Ctrl+Shift detected!")
             Task { await self.convertLayout() }
-            return true
         }
         
         return false
@@ -658,9 +941,16 @@ final class HotKeyManager: ObservableObject {
         Logger.hotkeys.debug("Fn: \(hasFn), Shift: \(hasShift), Others: \(hasOthers)")
         
         if hasFn && hasShift && !hasOthers {
+            // Debounce: предотвращаем многократное срабатывание при удержании
+            let now = Date.timeIntervalSinceReferenceDate
+            guard now - lastComboTriggerTime > comboDebounceInterval else {
+                Logger.hotkeys.debug("Fn+Shift debounced")
+                return false
+            }
+            lastComboTriggerTime = now
+            
             Logger.hotkeys.info("✅ Fn+Shift detected!")
             Task { await self.convertLayout() }
-            return true
         }
         
         return false
@@ -670,6 +960,10 @@ final class HotKeyManager: ObservableObject {
         let startTime = Date()
         
         Logger.conversion.info("Starting layout conversion via clipboard...")
+        
+        let pasteboard = NSPasteboard.general
+        // Сохраняем текущее содержимое буфера обмена
+        let clipboardState = ClipboardState(pasteboard: pasteboard)
         
         do {
             // Пробуем получить выделенный текст через Accessibility API
@@ -681,21 +975,14 @@ final class HotKeyManager: ObservableObject {
                 Logger.conversion.debug("Could not get text via Accessibility API, will use clipboard fallback")
             }
             
-            let pasteboard = NSPasteboard.general
-            
-            // Сохраняем текущее содержимое буфера обмена
-            let oldClipboardChangeCount = pasteboard.changeCount
-            let oldClipboardString = pasteboard.string(forType: .string)
-            let oldClipboardData = pasteboard.data(forType: .string)
-            
-            Logger.conversion.debug("Old clipboard count: \(oldClipboardChangeCount), content: '\(oldClipboardString?.prefix(30) ?? "nil")...'")
+            Logger.conversion.debug("Old clipboard count: \(clipboardState.changeCount), content: '\(clipboardState.stringContent?.prefix(30) ?? "nil")...'")
             
             // НЕ очищаем буфер - пусть остается старое содержимое
             // Это позволит нам определить, действительно ли было что-то скопировано
             
             // Симулируем Cmd+C для копирования выделенного текста
-            try await simulateKeyPress(key: 0x08, modifiers: .maskCommand)
-            try await Task.sleep(nanoseconds: 150_000_000) // Увеличили задержку для надежности
+            try await simulateKeyPress(key: KeyCode.c, modifiers: .maskCommand)
+            try await Task.sleep(nanoseconds: Timing.copyDelay)
             
             // Проверяем, изменился ли буфер обмена (был ли текст выделен)
             let newClipboardChangeCount = pasteboard.changeCount
@@ -704,20 +991,11 @@ final class HotKeyManager: ObservableObject {
             Logger.conversion.debug("New clipboard count: \(newClipboardChangeCount), content: '\(copiedText?.prefix(30) ?? "nil")...'")
             
             // Проверяем, что содержимое изменилось
-            guard newClipboardChangeCount > oldClipboardChangeCount,
+            guard newClipboardChangeCount > clipboardState.changeCount,
                   let copiedText = copiedText,
                   !copiedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 Logger.conversion.warning("Failed to copy selected text - restoring clipboard")
-                
-                // Восстанавливаем буфер обмена
-                if let oldData = oldClipboardData {
-                    pasteboard.clearContents()
-                    pasteboard.setData(oldData, forType: .string)
-                } else if let oldString = oldClipboardString {
-                    pasteboard.clearContents()
-                    pasteboard.setString(oldString, forType: .string)
-                }
-                
+                clipboardState.restore(to: pasteboard)
                 metrics.recordFailure()
                 await playErrorSound()
                 return
@@ -730,16 +1008,7 @@ final class HotKeyManager: ObservableObject {
             
             guard convertedText != copiedText else {
                 Logger.conversion.warning("Text unchanged after conversion")
-                
-                // Восстанавливаем старое содержимое буфера
-                if let oldData = oldClipboardData {
-                    pasteboard.clearContents()
-                    pasteboard.setData(oldData, forType: .string)
-                } else if let oldString = oldClipboardString {
-                    pasteboard.clearContents()
-                    pasteboard.setString(oldString, forType: .string)
-                }
-                
+                clipboardState.restore(to: pasteboard)
                 metrics.recordFailure()
                 await playErrorSound()
                 return
@@ -752,23 +1021,12 @@ final class HotKeyManager: ObservableObject {
             pasteboard.setString(convertedText, forType: .string)
             
             // Вставляем конвертированный текст
-            try await Task.sleep(nanoseconds: 50_000_000)
-            try await simulateKeyPress(key: 0x09, modifiers: .maskCommand)
+            try await Task.sleep(nanoseconds: Timing.pasteDelay)
+            try await simulateKeyPress(key: KeyCode.v, modifiers: .maskCommand)
             
             // Восстанавливаем оригинальное содержимое буфера обмена
-            try await Task.sleep(nanoseconds: 100_000_000)
-            if let oldData = oldClipboardData {
-                pasteboard.clearContents()
-                pasteboard.setData(oldData, forType: .string)
-                Logger.conversion.debug("Restored original clipboard content (data)")
-            } else if let oldString = oldClipboardString {
-                pasteboard.clearContents()
-                pasteboard.setString(oldString, forType: .string)
-                Logger.conversion.debug("Restored original clipboard content (string)")
-            } else {
-                pasteboard.clearContents()
-                Logger.conversion.debug("Cleared clipboard (was empty)")
-            }
+            try await Task.sleep(nanoseconds: Timing.restoreDelay)
+            clipboardState.restore(to: pasteboard)
             
             // Переключаем раскладку клавиатуры
             // Используем текст из AX если есть, иначе из буфера обмена
@@ -782,6 +1040,8 @@ final class HotKeyManager: ObservableObject {
             
         } catch {
             Logger.conversion.error("Conversion failed: \(error)")
+            // Восстанавливаем буфер при ошибке
+            clipboardState.restore(to: pasteboard)
             metrics.recordFailure()
             await playErrorSound()
         }
@@ -803,7 +1063,7 @@ final class HotKeyManager: ObservableObject {
         keyUp.flags = modifiers
         
         keyDown.post(tap: .cghidEventTap)
-        try await Task.sleep(nanoseconds: 10_000_000)
+        try await Task.sleep(nanoseconds: Timing.keyPressDelay)
         keyUp.post(tap: .cghidEventTap)
     }
     
@@ -882,70 +1142,81 @@ final class HotKeyManager: ObservableObject {
         var focusedElement: AnyObject?
         let result = AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedUIElementAttribute as CFString, &focusedElement)
         
-        guard result == .success, let focusedApp = focusedElement else {
+        guard result == .success, let focusedElement = focusedElement else {
             Logger.conversion.debug("Failed to get focused UI element")
             return nil
         }
         
-        // Пробуем получить выделенный текст
-        var selectedTextValue: AnyObject?
-        let selectedTextResult = AXUIElementCopyAttributeValue(
-            focusedApp as! AXUIElement,
-            kAXSelectedTextAttribute as CFString,
-            &selectedTextValue
-        )
+        // Безопасное приведение к AXUIElement
+        // CFTypeRef -> AXUIElement требует использования Unmanaged для безопасности
+        let axElement: AXUIElement = focusedElement as! AXUIElement
         
-        if selectedTextResult == .success, let selectedText = selectedTextValue as? String, !selectedText.isEmpty {
+        // Пробуем получить выделенный текст напрямую
+        if let selectedText = getAXAttribute(axElement, attribute: kAXSelectedTextAttribute) as? String,
+           !selectedText.isEmpty {
             Logger.conversion.debug("Got selected text via AX: '\(selectedText.prefix(30))...'")
             return selectedText
         }
         
-        // Если прямое получение не удалось, пробуем через значение и диапазон выделения
-        var rangeValue: AnyObject?
-        let rangeResult = AXUIElementCopyAttributeValue(
-            focusedApp as! AXUIElement,
-            kAXSelectedTextRangeAttribute as CFString,
-            &rangeValue
-        )
-        
-        guard rangeResult == .success, let range = rangeValue else {
+        // Если прямое получение не удалось, пробуем через диапазон выделения
+        guard let rangeValue = getAXAttribute(axElement, attribute: kAXSelectedTextRangeAttribute),
+              let axValue = rangeValue as! AXValue? else {
             Logger.conversion.debug("Failed to get selected text range")
             return nil
         }
         
-        var rangeLength = 0
-        AXValueGetValue(range as! AXValue, .cfRange, &rangeLength)
-        
-        // Проверяем, что длина выделения больше 0
+        // Извлекаем CFRange из AXValue
         var cfRange = CFRange(location: 0, length: 0)
-        guard AXValueGetValue(range as! AXValue, .cfRange, &cfRange), cfRange.length > 0 else {
+        guard AXValueGetValue(axValue, .cfRange, &cfRange), cfRange.length > 0 else {
             Logger.conversion.debug("No text selected - range length is 0")
             return nil
         }
         
         Logger.conversion.debug("Text selection range: location=\(cfRange.location), length=\(cfRange.length)")
         
-        // Пробуем получить текст по диапазону
-        var textValue: AnyObject?
-        let textResult = AXUIElementCopyAttributeValue(
-            focusedApp as! AXUIElement,
-            kAXValueAttribute as CFString,
-            &textValue
-        )
+        // Пробуем получить полный текст и извлечь выделенный фрагмент
+        guard let fullText = getAXAttribute(axElement, attribute: kAXValueAttribute) as? String else {
+            Logger.conversion.debug("Failed to get full text value")
+            return nil
+        }
         
-        if textResult == .success, let fullText = textValue as? String {
-            let startIndex = fullText.index(fullText.startIndex, offsetBy: cfRange.location, limitedBy: fullText.endIndex) ?? fullText.startIndex
-            let endIndex = fullText.index(startIndex, offsetBy: cfRange.length, limitedBy: fullText.endIndex) ?? fullText.endIndex
-            let selectedText = String(fullText[startIndex..<endIndex])
-            
-            if !selectedText.isEmpty {
-                Logger.conversion.debug("Extracted selected text from range: '\(selectedText.prefix(30))...'")
-                return selectedText
-            }
+        // Безопасное извлечение подстроки с проверкой границ
+        let selectedText = extractSubstring(from: fullText, range: cfRange)
+        
+        if let selectedText = selectedText, !selectedText.isEmpty {
+            Logger.conversion.debug("Extracted selected text from range: '\(selectedText.prefix(30))...'")
+            return selectedText
         }
         
         Logger.conversion.debug("Could not extract selected text")
         return nil
+    }
+    
+    /// Безопасно получает атрибут AX элемента
+    private func getAXAttribute(_ element: AXUIElement, attribute: String) -> AnyObject? {
+        var value: AnyObject?
+        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        return result == .success ? value : nil
+    }
+    
+    /// Безопасно извлекает подстроку по CFRange
+    private func extractSubstring(from string: String, range: CFRange) -> String? {
+        // Проверяем валидность диапазона
+        guard range.location >= 0, range.length > 0 else { return nil }
+        
+        // Используем UTF-16 для совместимости с CFRange
+        let utf16 = string.utf16
+        
+        guard range.location < utf16.count,
+              range.location + range.length <= utf16.count else {
+            Logger.conversion.warning("Range out of bounds: \(range.location)+\(range.length) > \(utf16.count)")
+            return nil
+        }
+        
+        let startIndex = utf16.index(utf16.startIndex, offsetBy: range.location)
+        let endIndex = utf16.index(startIndex, offsetBy: range.length)
+        
+        return String(utf16[startIndex..<endIndex])
     }
 }
 
@@ -955,11 +1226,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var hotKeyManager: HotKeyManager?
     private let settings = SettingsManager()
+    private var accessibilityObserver: NSObjectProtocol?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.ui.info("Application launched")
         
         setupStatusBar()
+        setupAccessibilityObserver()
         hotKeyManager = HotKeyManager(settings: self.settings)
         
         NSApp.setActivationPolicy(.accessory)
@@ -968,11 +1241,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationWillTerminate(_ notification: Notification) {
         Logger.ui.info("Application will terminate")
+        
+        if let observer = accessibilityObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        
         hotKeyManager = nil
         
         if let statusItem = statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
+        }
+    }
+    
+    private func setupAccessibilityObserver() {
+        // Оптимизация: обновляем иконку только при изменении статуса прав,
+        // а не каждую секунду через polling
+        accessibilityObserver = NotificationCenter.default.addObserver(
+            forName: .accessibilityStatusChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateStatusBarIcon()
         }
     }
     
@@ -990,10 +1280,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.target = self
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         
-        // Запускаем таймер для обновления визуального статуса
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.updateStatusBarIcon()
-        }
+        // Начальное обновление иконки
+        updateStatusBarIcon()
     }
     
     private func updateStatusBarIcon() {
