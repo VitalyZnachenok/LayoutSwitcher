@@ -2,6 +2,7 @@ import SwiftUI
 import Combine
 import os.log
 import Carbon.HIToolbox
+import ServiceManagement
 
 // MARK: - Logging
 extension Logger {
@@ -1329,6 +1330,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         soundItem.state = self.settings.configuration.soundEnabled ? .on : .off
         menu.addItem(soundItem)
         
+        let launchAtLoginItem = NSMenuItem(
+            title: "Запускать при старте системы",
+            action: #selector(toggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        launchAtLoginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(launchAtLoginItem)
+        
         menu.addItem(NSMenuItem(title: "Настройки...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Статистика...", action: #selector(showStatistics), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "О программе...", action: #selector(showAbout), keyEquivalent: ""))
@@ -1360,6 +1369,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc private func manualSwitch() {
         Task { await self.hotKeyManager?.convertLayout() }
+    }
+    
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+                Logger.ui.info("Launch at login disabled")
+            } else {
+                try service.register()
+                Logger.ui.info("Launch at login enabled")
+            }
+        } catch {
+            Logger.ui.error("Failed to toggle launch at login: \(error)")
+        }
     }
     
     @objc private func toggleSound() {
@@ -1471,6 +1495,7 @@ final class SettingsWindow {
     func show() {
         if let existing = Self.window, existing.isVisible {
             existing.makeKeyAndOrderFront(nil)
+            NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
@@ -1498,6 +1523,7 @@ final class SettingsWindow {
         Self.windowDelegate = delegate
         newWindow.delegate = delegate
         
+        NSApp.setActivationPolicy(.regular)
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -1506,6 +1532,7 @@ final class SettingsWindow {
         func windowWillClose(_ notification: Notification) {
             SettingsWindow.window = nil
             SettingsWindow.windowDelegate = nil
+            NSApp.setActivationPolicy(.accessory)
         }
     }
 }
