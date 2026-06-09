@@ -303,6 +303,16 @@ extension Notification.Name {
     static let accessibilityStatusChanged = Notification.Name("accessibilityStatusChanged")
 }
 
+// MARK: - App Version
+extension Bundle {
+    /// Версия приложения вида "1.5 (1)" из Info.plist (единый источник версии).
+    var appVersionString: String {
+        let short = infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        let build = infoDictionary?["CFBundleVersion"] as? String ?? "—"
+        return "\(short) (\(build))"
+    }
+}
+
 // MARK: - Key Codes Constants
 /// Константы для виртуальных кодов клавиш (избегаем magic numbers)
 private enum KeyCode {
@@ -316,11 +326,12 @@ private enum KeyCode {
 // MARK: - Timing Constants
 /// Константы для задержек (в наносекундах)
 private enum Timing {
-    static let copyDelay: UInt64 = 150_000_000       // 150ms - ожидание после копирования
     static let pasteDelay: UInt64 = 50_000_000       // 50ms - задержка перед вставкой
     static let restoreDelay: UInt64 = 100_000_000    // 100ms - задержка перед восстановлением буфера
     static let keyPressDelay: UInt64 = 10_000_000    // 10ms - задержка между keyDown и keyUp
     static let doubleShiftDelay: UInt64 = 100_000_000 // 100ms - задержка после двойного Shift
+    static let clipboardPollInterval: UInt64 = 10_000_000  // 10ms - шаг опроса буфера обмена
+    static let clipboardPollTimeout: UInt64 = 400_000_000  // 400ms - макс. ожидание копирования
 }
 
 // MARK: - Clipboard Helper
@@ -367,7 +378,14 @@ final class LayoutConverter {
     let rusToEng: [Character: Character] = LayoutConverter.rusToEngMappings
     
     lazy var engToRus: [Character: Character] = {
-        Dictionary(uniqueKeysWithValues: Self.rusToEngMappings.compactMap { ($1, $0) })
+        // Строим обратный словарь поэлементно, чтобы дубликаты значений
+        // не приводили к краху (Dictionary(uniqueKeysWithValues:) бросает fatalError).
+        var result: [Character: Character] = [:]
+        result.reserveCapacity(Self.rusToEngMappings.count)
+        for (rus, eng) in Self.rusToEngMappings {
+            result[eng] = rus
+        }
+        return result
     }()
     
     // Оптимизация: Set для O(1) поиска вместо O(n) в keys
@@ -647,21 +665,6 @@ final class HotKeyManager: ObservableObject {
         }
     }
     
-    private func handleEvent(_ event: CGEvent, type: CGEventType) -> Bool {
-        let config = settings.configuration
-        
-        switch config.hotKeyMode {
-        case .customHotkey:
-            return handleCustomHotkey(event, type: type)
-        case .doubleShift:
-            return handleDoubleModifier(event, type: type, targetFlag: .maskShift, keyCodes: [KeyCode.leftShift, KeyCode.rightShift])
-        case .ctrlShift:
-            return handleCtrlShift(event, type: type)
-        case .fnShift:
-            return handleFnShift(event, type: type)
-        }
-    }
-    
     // MARK: - Thread-safe handlers (для вызова из event tap callback)
     // Эти методы используют ТОЛЬКО кэшированные значения, не обращаются к @MainActor
     
@@ -800,163 +803,6 @@ final class HotKeyManager: ObservableObject {
         return false
     }
     
-    // MARK: - MainActor handlers (для прямого вызова)
-    
-    private func handleCustomHotkey(_ event: CGEvent, type: CGEventType) -> Bool {
-        guard type == .keyDown else { return false }
-        
-        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-        let flags = event.flags
-        let config = settings.configuration
-        
-        let expectedFlags = CGEventFlags(rawValue: UInt64(config.modifierFlags))
-        
-        if keyCode == config.keyCode && flags.contains(expectedFlags) {
-            Logger.hotkeys.info("Custom hotkey triggered: \(config.displayString)")
-            Task { await self.convertLayout() }
-            return true
-        }
-        
-        return false
-    }
-    
-    private func handleDoubleModifier(
-        _ event: CGEvent,
-        type: CGEventType,
-        targetFlag: CGEventFlags,
-        keyCodes: [UInt16]
-    ) -> Bool {
-        guard type == .flagsChanged else { return false }
-        
-        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-        guard keyCodes.contains(keyCode) else { return false }
-        
-        let flags = event.flags
-        let hasTargetFlag = flags.contains(targetFlag)
-        
-        // Use correct flag names
-        var otherModifiers: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl]
-        if targetFlag != .maskShift {
-            otherModifiers.insert(.maskShift)
-        }
-        
-        let hasOtherModifiers = !flags.intersection(otherModifiers).isEmpty
-        
-        // Use raw value for dictionary key
-        let flagKey = targetFlag.rawValue
-        
-        if hasOtherModifiers {
-            modifierPressCount[flagKey] = 0
-            lastModifierPressTime[flagKey] = 0
-            return false
-        }
-        
-        if hasTargetFlag {
-            return handleModifierPress(targetFlag: targetFlag)
-        } else {
-            Logger.hotkeys.debug("Modifier released")
-        }
-        
-        return false
-    }
-    
-    private func handleModifierPress(targetFlag: CGEventFlags) -> Bool {
-        let currentTime = Date.timeIntervalSinceReferenceDate
-        let config = settings.configuration
-        
-        // Use raw value for dictionary key
-        let flagKey = targetFlag.rawValue
-        
-        let lastTime = lastModifierPressTime[flagKey] ?? 0
-        let count = modifierPressCount[flagKey] ?? 0
-        
-        let timeSinceLastPress = lastTime > 0 ? currentTime - lastTime : Double.infinity
-        
-        Logger.hotkeys.debug("Modifier press: count=\(count), timeSince=\(String(format: "%.0f", timeSinceLastPress * 1000))ms")
-        
-        if timeSinceLastPress > config.maxDoubleShiftInterval {
-            modifierPressCount[flagKey] = 1
-            lastModifierPressTime[flagKey] = currentTime
-            Logger.hotkeys.debug("Starting new sequence")
-        } else if timeSinceLastPress < config.minDoubleShiftInterval {
-            Logger.hotkeys.debug("Too fast - ignoring")
-            return false
-        } else {
-            modifierPressCount[flagKey] = count + 1
-            
-            if modifierPressCount[flagKey] == 2 {
-                Logger.hotkeys.info("Double press detected!")
-                modifierPressCount[flagKey] = 0
-                lastModifierPressTime[flagKey] = 0
-                
-                Task {
-                    try? await Task.sleep(nanoseconds: Timing.doubleShiftDelay)
-                    await self.convertLayout()
-                }
-            } else {
-                lastModifierPressTime[flagKey] = currentTime
-            }
-        }
-        
-        return false
-    }
-    
-    private func handleCtrlShift(_ event: CGEvent, type: CGEventType) -> Bool {
-        guard type == .flagsChanged else { return false }
-        
-        let flags = event.flags
-        
-        // Проверяем, что нажаты именно Ctrl + Shift и ничего больше
-        let hasCtrl = flags.contains(.maskControl)
-        let hasShift = flags.contains(.maskShift)
-        let hasOthers = flags.contains(.maskCommand) || flags.contains(.maskAlternate)
-        
-        Logger.hotkeys.debug("Ctrl: \(hasCtrl), Shift: \(hasShift), Others: \(hasOthers)")
-        
-        if hasCtrl && hasShift && !hasOthers {
-            // Debounce: предотвращаем многократное срабатывание при удержании
-            let now = Date.timeIntervalSinceReferenceDate
-            guard now - lastComboTriggerTime > comboDebounceInterval else {
-                Logger.hotkeys.debug("Ctrl+Shift debounced")
-                return false
-            }
-            lastComboTriggerTime = now
-            
-            Logger.hotkeys.info("✅ Ctrl+Shift detected!")
-            Task { await self.convertLayout() }
-        }
-        
-        return false
-    }
-    
-    private func handleFnShift(_ event: CGEvent, type: CGEventType) -> Bool {
-        guard type == .flagsChanged else { return false }
-        
-        let flags = event.flags
-        
-        // Fn клавиша имеет специальный флаг
-        let hasFn = flags.contains(.maskSecondaryFn)
-        let hasShift = flags.contains(.maskShift)
-        let hasOthers = flags.contains(.maskCommand) || flags.contains(.maskAlternate) || flags.contains(.maskControl)
-        
-        Logger.hotkeys.debug("Fn: \(hasFn), Shift: \(hasShift), Others: \(hasOthers)")
-        
-        if hasFn && hasShift && !hasOthers {
-            // Debounce: предотвращаем многократное срабатывание при удержании
-            let now = Date.timeIntervalSinceReferenceDate
-            guard now - lastComboTriggerTime > comboDebounceInterval else {
-                Logger.hotkeys.debug("Fn+Shift debounced")
-                return false
-            }
-            lastComboTriggerTime = now
-            
-            Logger.hotkeys.info("✅ Fn+Shift detected!")
-            Task { await self.convertLayout() }
-        }
-        
-        return false
-    }
-    
     func convertLayout() async {
         let startTime = Date()
         
@@ -967,15 +813,6 @@ final class HotKeyManager: ObservableObject {
         let clipboardState = ClipboardState(pasteboard: pasteboard)
         
         do {
-            // Пробуем получить выделенный текст через Accessibility API
-            let selectedTextFromAX = await getSelectedTextViaAccessibility()
-            
-            if let selectedText = selectedTextFromAX {
-                Logger.conversion.info("Found selected text via Accessibility (\(selectedText.count) chars): '\(selectedText.prefix(50))...'")
-            } else {
-                Logger.conversion.debug("Could not get text via Accessibility API, will use clipboard fallback")
-            }
-            
             Logger.conversion.debug("Old clipboard count: \(clipboardState.changeCount), content: '\(clipboardState.stringContent?.prefix(30) ?? "nil")...'")
             
             // НЕ очищаем буфер - пусть остается старое содержимое
@@ -983,17 +820,17 @@ final class HotKeyManager: ObservableObject {
             
             // Симулируем Cmd+C для копирования выделенного текста
             try await simulateKeyPress(key: KeyCode.c, modifiers: .maskCommand)
-            try await Task.sleep(nanoseconds: Timing.copyDelay)
             
-            // Проверяем, изменился ли буфер обмена (был ли текст выделен)
-            let newClipboardChangeCount = pasteboard.changeCount
-            let copiedText = pasteboard.string(forType: .string)
+            // Опрашиваем буфер обмена, пока не появится скопированный текст.
+            // Это быстрее и надёжнее фиксированной задержки: возврат происходит
+            // сразу после готовности буфера, а на медленной системе ждём дольше.
+            let copiedTextOptional = await waitForCopiedText(
+                initialChangeCount: clipboardState.changeCount,
+                pasteboard: pasteboard
+            )
             
-            Logger.conversion.debug("New clipboard count: \(newClipboardChangeCount), content: '\(copiedText?.prefix(30) ?? "nil")...'")
-            
-            // Проверяем, что содержимое изменилось
-            guard newClipboardChangeCount > clipboardState.changeCount,
-                  let copiedText = copiedText,
+            // Проверяем, что текст был выделен и скопирован
+            guard let copiedText = copiedTextOptional,
                   !copiedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 Logger.conversion.warning("Failed to copy selected text - restoring clipboard")
                 clipboardState.restore(to: pasteboard)
@@ -1029,10 +866,8 @@ final class HotKeyManager: ObservableObject {
             try await Task.sleep(nanoseconds: Timing.restoreDelay)
             clipboardState.restore(to: pasteboard)
             
-            // Переключаем раскладку клавиатуры
-            // Используем текст из AX если есть, иначе из буфера обмена
-            let textForLayoutDetection = selectedTextFromAX ?? copiedText
-            let wasRussian = converter.detectLanguage(textForLayoutDetection)
+            // Переключаем раскладку клавиатуры на основе скопированного текста
+            let wasRussian = converter.detectLanguage(copiedText)
             await switchKeyboardLayout(toRussian: !wasRussian)
             
             let duration = Date().timeIntervalSince(startTime)
@@ -1046,6 +881,23 @@ final class HotKeyManager: ObservableObject {
             metrics.recordFailure()
             await playErrorSound()
         }
+    }
+    
+    /// Ожидает изменения буфера обмена после Cmd+C, опрашивая `changeCount`
+    /// с шагом `clipboardPollInterval` до таймаута `clipboardPollTimeout`.
+    /// Возвращает скопированный текст или nil, если буфер так и не изменился.
+    private func waitForCopiedText(initialChangeCount: Int, pasteboard: NSPasteboard) async -> String? {
+        var waited: UInt64 = 0
+        while waited < Timing.clipboardPollTimeout {
+            if pasteboard.changeCount > initialChangeCount {
+                return pasteboard.string(forType: .string)
+            }
+            try? await Task.sleep(nanoseconds: Timing.clipboardPollInterval)
+            waited += Timing.clipboardPollInterval
+        }
+        // Финальная проверка на случай изменения у самой границы таймаута
+        guard pasteboard.changeCount > initialChangeCount else { return nil }
+        return pasteboard.string(forType: .string)
     }
     
     private func simulateKeyPress(key: UInt16, modifiers: CGEventFlags = []) async throws {
@@ -1133,92 +985,6 @@ final class HotKeyManager: ObservableObject {
         )
     }
     
-    // MARK: - Accessibility API Helpers
-    
-    /// Получает выделенный текст через Accessibility API
-    private func getSelectedTextViaAccessibility() async -> String? {
-        // Получаем системный элемент с фокусом
-        let systemWideElement = AXUIElementCreateSystemWide()
-        
-        var focusedElement: AnyObject?
-        let result = AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedUIElementAttribute as CFString, &focusedElement)
-        
-        guard result == .success, let focusedElement = focusedElement else {
-            Logger.conversion.debug("Failed to get focused UI element")
-            return nil
-        }
-        
-        // Безопасное приведение к AXUIElement
-        // CFTypeRef -> AXUIElement требует использования Unmanaged для безопасности
-        let axElement: AXUIElement = focusedElement as! AXUIElement
-        
-        // Пробуем получить выделенный текст напрямую
-        if let selectedText = getAXAttribute(axElement, attribute: kAXSelectedTextAttribute) as? String,
-           !selectedText.isEmpty {
-            Logger.conversion.debug("Got selected text via AX: '\(selectedText.prefix(30))...'")
-            return selectedText
-        }
-        
-        // Если прямое получение не удалось, пробуем через диапазон выделения
-        guard let rangeValue = getAXAttribute(axElement, attribute: kAXSelectedTextRangeAttribute),
-              let axValue = rangeValue as! AXValue? else {
-            Logger.conversion.debug("Failed to get selected text range")
-            return nil
-        }
-        
-        // Извлекаем CFRange из AXValue
-        var cfRange = CFRange(location: 0, length: 0)
-        guard AXValueGetValue(axValue, .cfRange, &cfRange), cfRange.length > 0 else {
-            Logger.conversion.debug("No text selected - range length is 0")
-            return nil
-        }
-        
-        Logger.conversion.debug("Text selection range: location=\(cfRange.location), length=\(cfRange.length)")
-        
-        // Пробуем получить полный текст и извлечь выделенный фрагмент
-        guard let fullText = getAXAttribute(axElement, attribute: kAXValueAttribute) as? String else {
-            Logger.conversion.debug("Failed to get full text value")
-            return nil
-        }
-        
-        // Безопасное извлечение подстроки с проверкой границ
-        let selectedText = extractSubstring(from: fullText, range: cfRange)
-        
-        if let selectedText = selectedText, !selectedText.isEmpty {
-            Logger.conversion.debug("Extracted selected text from range: '\(selectedText.prefix(30))...'")
-            return selectedText
-        }
-        
-        Logger.conversion.debug("Could not extract selected text")
-        return nil
-    }
-    
-    /// Безопасно получает атрибут AX элемента
-    private func getAXAttribute(_ element: AXUIElement, attribute: String) -> AnyObject? {
-        var value: AnyObject?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        return result == .success ? value : nil
-    }
-    
-    /// Безопасно извлекает подстроку по CFRange
-    private func extractSubstring(from string: String, range: CFRange) -> String? {
-        // Проверяем валидность диапазона
-        guard range.location >= 0, range.length > 0 else { return nil }
-        
-        // Используем UTF-16 для совместимости с CFRange
-        let utf16 = string.utf16
-        
-        guard range.location < utf16.count,
-              range.location + range.length <= utf16.count else {
-            Logger.conversion.warning("Range out of bounds: \(range.location)+\(range.length) > \(utf16.count)")
-            return nil
-        }
-        
-        let startIndex = utf16.index(utf16.startIndex, offsetBy: range.location)
-        let endIndex = utf16.index(startIndex, offsetBy: range.length)
-        
-        return String(utf16[startIndex..<endIndex])
-    }
 }
 
 // MARK: - App Delegate
@@ -1434,7 +1200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = """
         Утилита для переключения раскладки клавиатуры
         
-        Версия: 1.0
+        Версия: \(Bundle.main.appVersionString)
         
         © 2024
         """
@@ -1947,7 +1713,7 @@ struct LayoutSwitcherApp: App {
         alert.informativeText = """
         Переключение раскладки клавиатуры
         
-        Версия: 1.3
+        Версия: \(Bundle.main.appVersionString)
         """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
