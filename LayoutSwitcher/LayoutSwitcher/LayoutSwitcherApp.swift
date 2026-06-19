@@ -1273,6 +1273,15 @@ private enum NGramCorpus {
 final class HotKeyManager: ObservableObject {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+
+    // КРИТИЧНО: event tap крутится на ВЫДЕЛЕННОМ потоке с собственным run loop,
+    // а НЕ на main run loop. Иначе любой стопор главного потока блокирует доставку
+    // глобального ввода (active session tap) — вплоть до полного зависания клавиатуры.
+    // Поток создаётся один раз (лениво) и переиспользуется при пересоздании tap.
+    // nonisolated(unsafe): публикуется из потока run loop, читается с main actor —
+    // синхронизация через DispatchSemaphore при первом старте.
+    private nonisolated(unsafe) var eventRunLoop: CFRunLoop?
+    private var eventThread: Thread?
     
     // Use UInt64 (raw value) instead of CGEventFlags as dictionary key
     // nonisolated(unsafe) потому что доступ из event tap callback (другой поток)
@@ -1369,7 +1378,18 @@ final class HotKeyManager: ObservableObject {
         }
         
         if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            if let rl = eventRunLoop {
+                CFRunLoopRemoveSource(rl, source, .commonModes)
+            }
+        }
+
+        // Останавливаем выделенный поток: помечаем отмену и будим/останавливаем
+        // его run loop, чтобы он вышел из CFRunLoopRunInMode и завершился.
+        // deinit не async и выполняется на main — только сигналим, не ждём.
+        eventThread?.cancel()
+        if let rl = eventRunLoop {
+            CFRunLoopStop(rl)
+            CFRunLoopWakeUp(rl)
         }
     }
     
@@ -1405,7 +1425,9 @@ final class HotKeyManager: ObservableObject {
                     }
                     
                     if let source = self.runLoopSource {
-                        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+                        if let rl = self.eventRunLoop {
+                            CFRunLoopRemoveSource(rl, source, .commonModes)
+                        }
                         self.runLoopSource = nil
                     }
                     // Уведомляем AppDelegate об изменении статуса
@@ -1444,10 +1466,16 @@ final class HotKeyManager: ObservableObject {
         }
         
         if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            if let rl = eventRunLoop {
+                CFRunLoopRemoveSource(rl, source, .commonModes)
+            }
             runLoopSource = nil
         }
-        
+
+        // Гарантируем, что выделенный поток с run loop запущен и его CFRunLoop
+        // опубликован, ДО того как добавим к нему source.
+        ensureEventThread()
+
         // Слушаем клики мыши всегда, чтобы сбрасывать счётчики набираемого слова при
         // смене позиции курсора (нужно как автопереключателю, так и конвертации
         // последнего слова по горячей клавише).
@@ -1528,10 +1556,46 @@ final class HotKeyManager: ObservableObject {
         self.eventTap = eventTap
         
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+        // Добавляем source к run loop ВЫДЕЛЕННОГО потока, а не к main run loop.
+        if let rl = eventRunLoop {
+            CFRunLoopAddSource(rl, runLoopSource, .commonModes)
+            // Будим выделенный run loop, чтобы он сразу подхватил новый source.
+            CFRunLoopWakeUp(rl)
+        } else {
+            Logger.hotkeys.error("❌ Event run loop is nil - falling back to main run loop")
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+        }
         CGEvent.tapEnable(tap: eventTap, enable: true)
         
         Logger.hotkeys.info("✅ Event tap created for mode: \(currentMode.rawValue), options: \(tapOptions == .listenOnly ? "listenOnly" : "defaultTap")")
+    }
+
+    /// Лениво создаёт выделенный поток с собственным run loop для event tap.
+    /// Поток создаётся ОДИН раз и переиспользуется при пересоздании tap.
+    /// Блокирует вызывающий (main) поток через семафор до публикации CFRunLoop,
+    /// чтобы setupEventTap() никогда не добавлял source к nil run loop.
+    private func ensureEventThread() {
+        guard eventThread == nil else { return }
+
+        let readySemaphore = DispatchSemaphore(value: 0)
+        let thread = Thread { [weak self] in
+            let rl = CFRunLoopGetCurrent()
+            self?.eventRunLoop = rl
+            // Сигналим готовность ПОСЛЕ публикации run loop.
+            readySemaphore.signal()
+            // Держим run loop живым. Пустой run loop без source мгновенно выходит,
+            // поэтому крутим в режиме с таймаутом, проверяя отмену.
+            while !Thread.current.isCancelled {
+                CFRunLoopRunInMode(.defaultMode, 0.5, false)
+            }
+        }
+        thread.qualityOfService = .userInteractive
+        thread.name = "com.layoutswitcher.eventtap"
+        thread.start()
+
+        // Ждём, пока поток стартует и опубликует свой CFRunLoop.
+        readySemaphore.wait()
+        eventThread = thread
     }
     
     /// Обработчик событий для вызова из callback (nonisolated, thread-safe)
