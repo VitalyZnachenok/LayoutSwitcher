@@ -18,7 +18,7 @@
 - **Динамический маппинг клавиш.** Соответствие символов строится из реально установленных в системе раскладок через `UCKeyTranslate`, а не из захардкоженной таблицы. Это корректно работает для нестандартных и национальных раскладок (с фолбэком на встроенную таблицу).
 - **Точное переключение по ID раскладки.** Раскладка выбирается по идентификатору из настроенной пары — без «угадывания».
 - **Несколько режимов горячих клавиш:**
-  - произвольная комбинация (custom combo);
+  - произвольная комбинация (custom combo) — записывается прямо в настройках нажатием;
   - двойной Shift (⇧⇧);
   - Ctrl + Shift (⌃⇧);
   - Fn + Shift (fn⇧);
@@ -55,7 +55,7 @@
 
 ### Установка
 
-1. Откройте `LayoutSwitcher-2.1.dmg`.
+1. Откройте `LayoutSwitcher-<версия>.dmg`.
 2. Перетащите **LayoutSwitcher** в папку **Applications**.
 
 > **Внимание (Gatekeeper).** Текущая сборка подписана сертификатом *Apple Development* и **не нотаризована** Apple. При первом запуске macOS покажет предупреждение. Откройте приложение через **правый клик (Control + клик) → «Открыть»** и подтвердите запуск. Это нужно сделать один раз.
@@ -69,7 +69,7 @@
 ./LayoutSwitcher/scripts/make-dmg.sh
 ```
 
-Готовый DMG появится в `build/LayoutSwitcher-2.1.dmg`. Скрипт использует обычную автоматическую подпись *Apple Development* и **не выполняет нотаризацию**.
+Готовый DMG появится в `build/LayoutSwitcher-<версия>.dmg` (версия берётся из `CFBundleShortVersionString` собранного `.app`). Скрипт использует обычную автоматическую подпись *Apple Development* и **не выполняет нотаризацию**.
 
 > Скрипт `LayoutSwitcher/scripts/package.sh` предназначен для будущего релизного пути с сертификатом **Developer ID Application** и **нотаризацией** через `notarytool`. Используйте его, когда появится Developer ID-сертификат и профиль notarytool.
 
@@ -89,7 +89,7 @@ Typed `ghbdtn` instead of `привет`? Press a hotkey and LayoutSwitcher inst
 - **Dynamic key mapping.** The character mapping is built from the real installed layouts via `UCKeyTranslate`, not a hardcoded table. This works correctly for non-standard and national layouts (with a built-in table fallback).
 - **Precise layout selection by ID.** The target layout is chosen by ID from the configured layout pair — no guesswork.
 - **Multiple hotkey modes:**
-  - custom combo;
+  - custom combo — record it right in Settings by pressing it;
   - double Shift (⇧⇧);
   - Ctrl + Shift (⌃⇧);
   - Fn + Shift (fn⇧);
@@ -126,7 +126,7 @@ How to grant it:
 
 ### Install
 
-1. Open `LayoutSwitcher-2.1.dmg`.
+1. Open `LayoutSwitcher-<version>.dmg`.
 2. Drag **LayoutSwitcher** into the **Applications** folder.
 
 > **Gatekeeper note.** This build is signed with an *Apple Development* certificate and is **not notarized** by Apple. On first launch macOS will show a warning. Open the app via **right-click (Control-click) → “Open”** and confirm. You only need to do this once.
@@ -140,6 +140,6 @@ How to grant it:
 ./LayoutSwitcher/scripts/make-dmg.sh
 ```
 
-The resulting DMG appears at `build/LayoutSwitcher-2.1.dmg`. The script uses ordinary automatic *Apple Development* signing and does **not** notarize.
+The resulting DMG appears at `build/LayoutSwitcher-<version>.dmg` (the version is read from the built `.app`'s `CFBundleShortVersionString`). The script uses ordinary automatic *Apple Development* signing and does **not** notarize.
 
 > The `LayoutSwitcher/scripts/package.sh` script is for the future release path with a **Developer ID Application** certificate and **notarization** via `notarytool`. Use it once a Developer ID certificate and a notarytool profile are available.

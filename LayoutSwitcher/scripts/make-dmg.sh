@@ -27,8 +27,9 @@ REPO_ROOT="$(dirname "$PROJECT_DIR")"             # .../layoutswitcher
 PROJECT="$PROJECT_DIR/LayoutSwitcher.xcodeproj"
 SCHEME="LayoutSwitcher"
 APP_NAME="LayoutSwitcher"
-VERSION="2.1"
-VOLNAME="$APP_NAME $VERSION"
+# VERSION читается из собранного .app (CFBundleShortVersionString) ПОСЛЕ экспорта —
+# см. ниже. Раньше здесь было захардкожено "2.1" и расходилось с MARKETING_VERSION
+# в проекте при каждом бампе версии.
 
 BUILD_DIR="$REPO_ROOT/build"
 ARCHIVE_PATH="$BUILD_DIR/$APP_NAME.xcarchive"
@@ -38,7 +39,6 @@ APP_PATH="$EXPORT_DIR/$APP_NAME.app"
 SRC_BG="$SCRIPT_DIR/assets/dmg-background.png"
 BG_WORK="$BUILD_DIR/dmg-bg"                       # рабочая папка с подготовленным фоном
 RW_DMG="$BUILD_DIR/$APP_NAME-rw.dmg"
-FINAL_DMG="$BUILD_DIR/$APP_NAME-$VERSION.dmg"
 
 # Геометрия окна DMG
 WIN_W=660
@@ -50,7 +50,7 @@ APPS_ICON_X=495
 APPS_ICON_Y=255
 
 echo "==> Очистка прошлых артефактов"
-rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$BG_WORK" "$RW_DMG" "$FINAL_DMG"
+rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$BG_WORK" "$RW_DMG" "$BUILD_DIR/$APP_NAME"-*.dmg
 mkdir -p "$BUILD_DIR"
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,11 @@ fi
 
 echo "==> Проверка подписи .app (best-effort)"
 codesign --verify --verbose "$APP_PATH" || echo "!! codesign verify сообщил о проблеме (ожидаемо для development-подписи)"
+
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo dev)"
+VOLNAME="$APP_NAME $VERSION"
+FINAL_DMG="$BUILD_DIR/$APP_NAME-$VERSION.dmg"
+echo "==> Версия приложения: $VERSION"
 
 # ---------------------------------------------------------------------------
 # 2. Подготовка фона (resize до 660x440 + @2x ретина -> multi-res TIFF)

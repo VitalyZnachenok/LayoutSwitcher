@@ -40,7 +40,7 @@ enum LK: String {
     // DetectionEngine.displayName
     case deDictionary, deNgram
     // Валидация
-    case valMinIntervalGt0, valMaxGtMin, valMaxTooBig, valKeyEmpty, valNeedModifier, valMinWordLength
+    case valMinIntervalGt0, valMaxGtMin, valMaxTooBig, valKeyEmpty, valNeedModifier, valMinWordLength, valLayoutsSame
     // Меню статус-бара
     case menuPermsGranted, menuPermsRequired, menuSwitchLayout, menuPlaySounds, menuLaunchAtLogin
     case menuAutoSwitch, menuSettings, menuStatistics, menuAbout, menuGrantPerms, menuQuit
@@ -58,6 +58,7 @@ enum LK: String {
     case ctrlShiftDesc, fnShiftDesc, fnShiftNote
     case singleAltDesc, singleAltNote, doubleAltHint
     case fmtMs, lblCurrentCombo, lblDefaultCombo
+    case hotkeyRecording, hotkeyRecordingHint, helpRecordHotkey
     // Секция автопереключения
     case secAutoSwitch, autoSwitchDesc, lblDetectionEngine, engineNgramDesc, engineDictDesc
     case lblMinWordLength, lblWarnSound, helpPlaySound
@@ -169,6 +170,8 @@ final class LocalizationManager: ObservableObject {
                            "en": "At least one modifier must be selected"],
         .valMinWordLength: ["ru": "Минимальная длина слова должна быть не меньше 2",
                             "en": "Minimum word length must be at least 2"],
+        .valLayoutsSame: ["ru": "Раскладка 1 и раскладка 2 не могут совпадать",
+                          "en": "Layout 1 and Layout 2 cannot be the same"],
 
         // Меню статус-бара
         .menuPermsGranted: ["ru": "✅ Разрешения предоставлены", "en": "✅ Permissions granted"],
@@ -240,6 +243,10 @@ final class LocalizationManager: ObservableObject {
         .fmtMs: ["ru": "%.0f мс", "en": "%.0f ms"],
         .lblCurrentCombo: ["ru": "Текущая комбинация:", "en": "Current shortcut:"],
         .lblDefaultCombo: ["ru": "По умолчанию: ⌘⇧L", "en": "Default: ⌘⇧L"],
+        .hotkeyRecording: ["ru": "Нажмите комбинацию…", "en": "Press a shortcut…"],
+        .hotkeyRecordingHint: ["ru": "Esc — отменить запись", "en": "Esc — cancel recording"],
+        .helpRecordHotkey: ["ru": "Нажать, затем ввести новую комбинацию",
+                            "en": "Click, then press a new shortcut"],
 
         // Секция автопереключения
         .secAutoSwitch: ["ru": "Автопереключение раскладки", "en": "Auto layout switching"],
@@ -640,7 +647,13 @@ final class SettingsManager: ObservableObject {
         if configuration.autoSwitchMode != .off && configuration.minWordLength < 2 {
             errors.append(L(.valMinWordLength))
         }
-        
+
+        if !configuration.layout1ID.isEmpty,
+           !configuration.layout2ID.isEmpty,
+           configuration.layout1ID == configuration.layout2ID {
+            errors.append(L(.valLayoutsSame))
+        }
+
         configurationErrors = errors
         
         if !errors.isEmpty {
@@ -1303,7 +1316,13 @@ final class HotKeyManager: ObservableObject {
     private let wrongLayoutDetector: WrongLayoutDetector
     private let ngramDetector: NGramLayoutDetector
     let metrics = ConversionMetrics()
-    
+
+    // Защита от повторного входа: без неё удержание customHotkey (авто-повтор клавиши
+    // системой) спавнит несколько параллельных convertLayout(), гоняющихся за одним
+    // NSPasteboard. MainActor гарантирует, что проверка+установка ниже атомарны
+    // относительно других задач на этом же акторе (нет await между ними).
+    private var isConverting = false
+
     // Автопереключатель: буфер текущего набираемого слова (для детектора по NSSpellChecker).
     // Доступ только из callback (поток run loop), поэтому nonisolated(unsafe).
     private nonisolated(unsafe) var typingBuffer: String = ""
@@ -1363,7 +1382,7 @@ final class HotKeyManager: ObservableObject {
         cachedMaxInterval = config.maxDoubleShiftInterval
         cachedAutoSwitchMode = config.autoSwitchMode
         cachedMinWordLength = config.minWordLength
-        resetWordTracking()
+        resetWordTrackingFromMainActor()
         Logger.hotkeys.debug("Configuration cached: mode=\(self.cachedHotKeyMode.rawValue), autoSwitch=\(self.cachedAutoSwitchMode.rawValue)")
     }
     
@@ -1795,7 +1814,26 @@ final class HotKeyManager: ObservableObject {
     }
     
     // MARK: - Auto Layout Switcher & Word Tracking
-    
+
+    /// Сбрасывает отслеживание слова из MainActor-контекста (например, при смене
+    /// настроек). typingBuffer/currentWordLength/wordBeforeBoundaryLength/boundaryCount
+    /// мутируются без блокировки в feedTyping() на выделенном event-tap потоке —
+    /// вызывать resetWordTracking() отсюда напрямую значило бы гонку данных между
+    /// главным потоком и event-tap потоком. Поэтому сброс планируется на run loop
+    /// event-tap потока, где и происходят все остальные мутации этих полей.
+    private func resetWordTrackingFromMainActor() {
+        guard let rl = eventRunLoop else {
+            // Event-поток ещё не создан (самый первый вызов из init) — конкурентного
+            // доступа быть не может, сбрасываем напрямую.
+            resetWordTracking()
+            return
+        }
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) { [weak self] in
+            self?.resetWordTracking()
+        }
+        CFRunLoopWakeUp(rl)
+    }
+
     /// Полный сброс отслеживания набираемого слова (буфер + все счётчики).
     private nonisolated func resetWordTracking() {
         typingBuffer = ""
@@ -2022,9 +2060,16 @@ final class HotKeyManager: ObservableObject {
     }
     
     func convertLayout() async {
+        guard !isConverting else {
+            Logger.conversion.debug("Conversion already in progress - ignoring re-entrant trigger")
+            return
+        }
+        isConverting = true
+        defer { isConverting = false }
+
         let startTime = Date()
         Logger.conversion.info("Starting layout conversion...")
-        
+
         let pasteboard = NSPasteboard.general
         let clipboardState = ClipboardState(pasteboard: pasteboard)
         
@@ -2558,6 +2603,8 @@ struct SettingsView: View {
     @ObservedObject var settings: SettingsManager
     @ObservedObject private var loc = LocalizationManager.shared
     @State private var isVisible = false
+    @State private var isRecordingHotkey = false
+    @State private var hotkeyRecorderMonitor: Any?
     
     var body: some View {
         VStack(spacing: 0) {
@@ -2845,23 +2892,68 @@ struct SettingsView: View {
             HStack {
                 Text(L(.lblCurrentCombo))
                     .font(.subheadline.weight(.medium))
-                
+
                 Spacer()
-                
-                Text(settings.configuration.displayString)
-                    .font(.system(.body, design: .monospaced).weight(.medium))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Color.accentColor.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
-                    .foregroundStyle(Color.accentColor)
+
+                Button {
+                    isRecordingHotkey ? stopRecordingHotkey() : startRecordingHotkey()
+                } label: {
+                    Text(isRecordingHotkey ? L(.hotkeyRecording) : settings.configuration.displayString)
+                        .font(.system(.body, design: .monospaced).weight(.medium))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(
+                            (isRecordingHotkey ? Color.red : Color.accentColor).opacity(0.15),
+                            in: RoundedRectangle(cornerRadius: 6)
+                        )
+                        .foregroundStyle(isRecordingHotkey ? Color.red : Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help(L(.helpRecordHotkey))
             }
-            
-            Text(L(.lblDefaultCombo))
+
+            Text(isRecordingHotkey ? L(.hotkeyRecordingHint) : L(.lblDefaultCombo))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .onDisappear { stopRecordingHotkey() }
     }
-    
+
+    /// Начинает запись новой комбинации: следующее keyDown-событие в окне настроек
+    /// становится новым custom-хоткеем. Esc без модификаторов отменяет запись.
+    private func startRecordingHotkey() {
+        stopRecordingHotkey()
+        isRecordingHotkey = true
+        hotkeyRecorderMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Escape без модификаторов — отмена записи, а не сама комбинация.
+            if event.keyCode == 0x35 && event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty {
+                stopRecordingHotkey()
+                return nil
+            }
+            applyRecordedHotkey(event)
+            stopRecordingHotkey()
+            return nil
+        }
+    }
+
+    private func stopRecordingHotkey() {
+        isRecordingHotkey = false
+        if let monitor = hotkeyRecorderMonitor {
+            NSEvent.removeMonitor(monitor)
+            hotkeyRecorderMonitor = nil
+        }
+    }
+
+    private func applyRecordedHotkey(_ event: NSEvent) {
+        let character = (event.charactersIgnoringModifiers ?? "").uppercased()
+        guard !character.isEmpty else { return }
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        settings.configuration.keyCode = event.keyCode
+        settings.configuration.keyCharacter = character
+        settings.configuration.modifierFlags = modifiers.rawValue
+        Logger.ui.info("Custom hotkey recorded: \(settings.configuration.displayString)")
+    }
+
     private var autoSwitchSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label(L(.secAutoSwitch), systemImage: "character.cursor.ibeam")
