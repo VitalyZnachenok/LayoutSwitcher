@@ -14,7 +14,8 @@
 
 ### Возможности
 
-- **Конвертация последнего слова или выделения.** По горячей клавише преобразует последнее набранное слово либо текущее выделение между двумя настроенными раскладками. Если выделения нет, приложение само определяет и выделяет последнее слово.
+- **Конвертация последнего слова или выделения.** По горячей клавише преобразует последнее набранное слово либо текущее выделение между двумя настроенными раскладками. Если выделения нет, приложение само находит последнее слово перед курсором.
+- **Замена через Accessibility.** Текст читается и заменяется прямо в поле ввода через AX API: без буфера обмена, синтетических нажатий и задержек (единицы миллисекунд вместо ~300 мс). Приложения, которые этого не поддерживают, автоматически обслуживаются прежним путём через ⌘C/⌘V, причём буфер обмена восстанавливается целиком, включая картинки и файлы.
 - **Динамический маппинг клавиш.** Соответствие символов строится из реально установленных в системе раскладок через `UCKeyTranslate`, а не из захардкоженной таблицы. Это корректно работает для нестандартных и национальных раскладок (с фолбэком на встроенную таблицу).
 - **Точное переключение по ID раскладки.** Раскладка выбирается по идентификатору из настроенной пары — без «угадывания».
 - **Несколько режимов горячих клавиш:**
@@ -26,7 +27,8 @@
   - двойное нажатие Alt (⌥⌥) с настраиваемым интервалом.
 - **Автоопределение ввода в неправильной раскладке** с двумя движками детекции на выбор:
   - системный словарь (`NSSpellChecker`);
-  - статистическая модель n-грамм — ловит и несловарные слова (имена, сленг).
+  - статистическая модель триграмм (ru, en, uk, de), обученная на частотных словарях OpenSubtitles, — ловит и несловарные слова (имена, сленг); на отложенной выборке ~0.1 % ложных срабатываний при ~97 % распознавания. Для других языков автоматически используется словарь.
+- **Автодетекция для любой пары раскладок**, не только ru/en: конверсия строится по реальным раскладкам системы, язык определяется из свойств раскладки.
 - **Режимы автопереключения:**
   - Выкл;
   - Предупреждение звуком;
@@ -36,7 +38,7 @@
 - **Запуск при старте системы** (Launch at Login).
 - **Двуязычный интерфейс (RU/EN)** — по умолчанию язык системы, переключается на лету.
 - **Настраиваемые звуки** с регулировкой громкости.
-- **Статистика использования** конвертаций.
+- **Статистика использования** конвертаций (сохраняется между запусками).
 
 ### Требования
 
@@ -58,7 +60,7 @@
 1. Откройте `LayoutSwitcher-<версия>.dmg`.
 2. Перетащите **LayoutSwitcher** в папку **Applications**.
 
-> **Внимание (Gatekeeper).** Текущая сборка подписана сертификатом *Apple Development* и **не нотаризована** Apple. При первом запуске macOS покажет предупреждение. Откройте приложение через **правый клик (Control + клик) → «Открыть»** и подтвердите запуск. Это нужно сделать один раз.
+Релизные сборки начиная с 3.0 подписаны сертификатом **Developer ID** и **нотаризованы** Apple — запускаются без предупреждений Gatekeeper.
 
 ### Сборка из исходников
 
@@ -69,9 +71,15 @@
 ./LayoutSwitcher/scripts/make-dmg.sh
 ```
 
-Готовый DMG появится в `build/LayoutSwitcher-<версия>.dmg` (версия берётся из `CFBundleShortVersionString` собранного `.app`). Скрипт использует обычную автоматическую подпись *Apple Development* и **не выполняет нотаризацию**.
+Готовый DMG появится в `build/LayoutSwitcher-<версия>.dmg` (версия берётся из `CFBundleShortVersionString` собранного `.app`). Скрипт использует обычную автоматическую подпись *Apple Development* и **не выполняет нотаризацию** — для локального использования.
 
-> Скрипт `LayoutSwitcher/scripts/package.sh` предназначен для будущего релизного пути с сертификатом **Developer ID Application** и **нотаризацией** через `notarytool`. Используйте его, когда появится Developer ID-сертификат и профиль notarytool.
+Релизный DMG (Developer ID + нотаризация через `notarytool`):
+
+```bash
+NOTARY_PROFILE=<имя профиля notarytool> ./LayoutSwitcher/scripts/package.sh
+```
+
+Юнит-тесты (схема `LayoutSwitcher`, таргет `LayoutSwitcherTests`): `xcodebuild test -scheme LayoutSwitcher -destination 'platform=macOS'`. Код разложен по папкам `Core/` (конвертация, детекция, Accessibility), `Hotkeys/` (event tap, распознавание) и `UI/`. Модели n-грамм пересобираются скриптом `LayoutSwitcher/scripts/ngram/build_ngram.py` (см. README рядом с ним).
 
 ---
 
@@ -85,7 +93,8 @@ Typed `ghbdtn` instead of `привет`? Press a hotkey and LayoutSwitcher inst
 
 ### Features
 
-- **Convert the last word or the selection.** A hotkey converts the last typed word or the current selection between two configured layouts. With no selection, the app detects and selects the last word automatically.
+- **Convert the last word or the selection.** A hotkey converts the last typed word or the current selection between two configured layouts. With no selection, the app finds the last word before the caret itself.
+- **Replacement via Accessibility.** The text is read and replaced right inside the input field through the AX API: no clipboard, no synthetic keystrokes, no delays (milliseconds instead of ~300 ms). Apps that don't support it automatically fall back to the ⌘C/⌘V path, and the clipboard is restored in full, including images and files.
 - **Dynamic key mapping.** The character mapping is built from the real installed layouts via `UCKeyTranslate`, not a hardcoded table. This works correctly for non-standard and national layouts (with a built-in table fallback).
 - **Precise layout selection by ID.** The target layout is chosen by ID from the configured layout pair — no guesswork.
 - **Multiple hotkey modes:**
@@ -97,7 +106,8 @@ Typed `ghbdtn` instead of `привет`? Press a hotkey and LayoutSwitcher inst
   - double Alt tap (⌥⌥) with a configurable interval.
 - **Automatic detection of wrong-layout typing** with two selectable engines:
   - system dictionary (`NSSpellChecker`);
-  - a statistical n-gram model — also catches non-dictionary words (names, slang).
+  - a statistical trigram model (ru, en, uk, de) trained on OpenSubtitles frequency lists — also catches non-dictionary words (names, slang); ~0.1% false positives at ~97% recall on a held-out set. Other languages fall back to the dictionary automatically.
+- **Auto-detection for any layout pair**, not just ru/en: the conversion is built from the real system layouts and the language comes from the layout's properties.
 - **Auto-switch modes:**
   - Off;
   - Warning sound;
@@ -107,7 +117,7 @@ Typed `ghbdtn` instead of `привет`? Press a hotkey and LayoutSwitcher inst
 - **Launch at Login.**
 - **Bilingual UI (RU/EN)** — defaults to the system language, switchable at runtime.
 - **Configurable sounds** with volume control.
-- **Usage statistics** for conversions.
+- **Usage statistics** for conversions (persisted across launches).
 
 ### Requirements
 
@@ -129,7 +139,7 @@ How to grant it:
 1. Open `LayoutSwitcher-<version>.dmg`.
 2. Drag **LayoutSwitcher** into the **Applications** folder.
 
-> **Gatekeeper note.** This build is signed with an *Apple Development* certificate and is **not notarized** by Apple. On first launch macOS will show a warning. Open the app via **right-click (Control-click) → “Open”** and confirm. You only need to do this once.
+Release builds starting with 3.0 are signed with a **Developer ID** certificate and **notarized** by Apple — they launch without Gatekeeper warnings.
 
 ### Build from source
 
@@ -140,6 +150,12 @@ How to grant it:
 ./LayoutSwitcher/scripts/make-dmg.sh
 ```
 
-The resulting DMG appears at `build/LayoutSwitcher-<version>.dmg` (the version is read from the built `.app`'s `CFBundleShortVersionString`). The script uses ordinary automatic *Apple Development* signing and does **not** notarize.
+The resulting DMG appears at `build/LayoutSwitcher-<version>.dmg` (the version is read from the built `.app`'s `CFBundleShortVersionString`). The script uses ordinary automatic *Apple Development* signing and does **not** notarize — for local use.
 
-> The `LayoutSwitcher/scripts/package.sh` script is for the future release path with a **Developer ID Application** certificate and **notarization** via `notarytool`. Use it once a Developer ID certificate and a notarytool profile are available.
+Release DMG (Developer ID + notarization via `notarytool`):
+
+```bash
+NOTARY_PROFILE=<notarytool profile name> ./LayoutSwitcher/scripts/package.sh
+```
+
+Unit tests (scheme `LayoutSwitcher`, target `LayoutSwitcherTests`): `xcodebuild test -scheme LayoutSwitcher -destination 'platform=macOS'`. The code lives in `Core/` (conversion, detection, Accessibility), `Hotkeys/` (event tap, recognizers) and `UI/`. The n-gram models are rebuilt with `LayoutSwitcher/scripts/ngram/build_ngram.py` (see the README next to it).
