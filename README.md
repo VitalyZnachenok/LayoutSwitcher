@@ -18,6 +18,7 @@
 - **Замена через Accessibility.** Текст читается и заменяется прямо в поле ввода через AX API: без буфера обмена, синтетических нажатий и задержек (единицы миллисекунд вместо ~300 мс). Приложения, которые этого не поддерживают, автоматически обслуживаются прежним путём через ⌘C/⌘V, причём буфер обмена восстанавливается целиком, включая картинки и файлы.
 - **Динамический маппинг клавиш.** Соответствие символов строится из реально установленных в системе раскладок через `UCKeyTranslate`, а не из захардкоженной таблицы. Это корректно работает для нестандартных и национальных раскладок (с фолбэком на встроенную таблицу).
 - **Точное переключение по ID раскладки.** Раскладка выбирается по идентификатору из настроенной пары — без «угадывания».
+- **Переключение «прилипает» и в режиме раскладки для каждого документа.** При включённой опции macOS «Автоматически переключаться на источник ввода документа» обычный `TISSelectInputSource` из фонового приложения не действует: активное приложение возвращает свою запомненную раскладку. LayoutSwitcher просит переключиться само приложение с фокусом ввода (через его TSM-порт, как это делает системное меню ввода), а при недоступности этого пути откатывается на `TISSelectInputSource`.
 - **Несколько режимов горячих клавиш:**
   - произвольная комбинация (custom combo) — записывается прямо в настройках нажатием;
   - двойной Shift (⇧⇧);
@@ -97,6 +98,7 @@ Typed `ghbdtn` instead of `привет`? Press a hotkey and LayoutSwitcher inst
 - **Replacement via Accessibility.** The text is read and replaced right inside the input field through the AX API: no clipboard, no synthetic keystrokes, no delays (milliseconds instead of ~300 ms). Apps that don't support it automatically fall back to the ⌘C/⌘V path, and the clipboard is restored in full, including images and files.
 - **Dynamic key mapping.** The character mapping is built from the real installed layouts via `UCKeyTranslate`, not a hardcoded table. This works correctly for non-standard and national layouts (with a built-in table fallback).
 - **Precise layout selection by ID.** The target layout is chosen by ID from the configured layout pair — no guesswork.
+- **The switch sticks even with per-document input sources.** When the macOS option “Automatically switch to a document's input source” is on, a plain `TISSelectInputSource` from a background app has no lasting effect: the active app restores its remembered layout. LayoutSwitcher instead asks the app that has keyboard focus to switch (via its TSM port, the same way the system Input menu does), falling back to `TISSelectInputSource` when that path is unavailable.
 - **Multiple hotkey modes:**
   - custom combo — record it right in Settings by pressing it;
   - double Shift (⇧⇧);

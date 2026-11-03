@@ -92,10 +92,19 @@ enum LayoutManager {
     }
     
     /// Активирует раскладку по точному ID. Возвращает true при успехе.
+    ///
+    /// Сначала просим переключиться само приложение с фокусом ввода (как это
+    /// делает системное меню ввода): только так переключение сохраняется при
+    /// включённой опции «Автоматически переключаться на источник ввода
+    /// документа». Если этот путь недоступен — обычный TISSelectInputSource.
     @discardableResult
     static func switchTo(layoutID: String) -> Bool {
         guard !layoutID.isEmpty, let source = source(for: layoutID) else {
             return false
+        }
+        if TSMInputSourceSelector.selectInFocusedApp(source) {
+            Logger.conversion.info("✅ Switched layout to \(layoutID) via focused app")
+            return true
         }
         let status = TISSelectInputSource(source)
         if status == noErr {
