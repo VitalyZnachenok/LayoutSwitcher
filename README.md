@@ -40,6 +40,7 @@
 - **Двуязычный интерфейс (RU/EN)** — по умолчанию язык системы, переключается на лету.
 - **Настраиваемые звуки** с регулировкой громкости.
 - **Статистика использования** конвертаций (сохраняется между запусками).
+- **Проверка обновлений.** При запуске и раз в сутки приложение запрашивает у GitHub последний релиз; если вышла новая версия, в меню появляется пункт «Скачать версию…» и один раз показывается предложение скачать DMG. Ничего не устанавливается автоматически; проверку можно выключить в настройках.
 
 ### Требования
 
@@ -120,6 +121,7 @@ Typed `ghbdtn` instead of `привет`? Press a hotkey and LayoutSwitcher inst
 - **Bilingual UI (RU/EN)** — defaults to the system language, switchable at runtime.
 - **Configurable sounds** with volume control.
 - **Usage statistics** for conversions (persisted across launches).
+- **Update check.** At launch and once a day the app asks GitHub for the latest release; when a newer version exists, a “Download version…” item appears in the menu and a one-time prompt offers the DMG. Nothing is installed automatically; the check can be turned off in Settings.
 
 ### Requirements
 

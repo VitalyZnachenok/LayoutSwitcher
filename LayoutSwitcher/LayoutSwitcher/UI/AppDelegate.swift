@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import Combine
 import ServiceManagement
 import os.log
 
@@ -26,6 +27,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyManager: HotKeyManager?
     private let settings = SettingsManager()
     private var accessibilityObserver: NSObjectProtocol?
+    private let updates = UpdateChecker.shared
+    private var updateCancellable: AnyCancellable?
+    /// Версия, о которой уже показывали алерт в этом запуске (повторно не надоедаем).
+    private var updateAlertShownFor: String?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.ui.info("Application launched")
@@ -36,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         
         NSApp.setActivationPolicy(.accessory)
         requestAccessibilityPermissions()
+        setupUpdateChecker()
     }
     
     func applicationWillTerminate(_ notification: Notification) {
@@ -101,6 +107,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
+        if let release = updates.available {
+            let updateItem = NSMenuItem(
+                title: String(format: L(.menuDownloadUpdate), release.version),
+                action: #selector(downloadUpdate),
+                keyEquivalent: ""
+            )
+            menu.addItem(updateItem)
+        }
         menu.addItem(.separator())
         
         let convertItem = NSMenuItem(
@@ -153,6 +167,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.statusItem?.menu = nil
         }
+    }
+    
+    // MARK: - Updates
+    
+    private func setupUpdateChecker() {
+        updateCancellable = updates.$available
+            .receive(on: RunLoop.main)
+            .sink { [weak self] release in
+                guard let self, let release, self.updateAlertShownFor != release.version else { return }
+                self.updateAlertShownFor = release.version
+                self.showUpdateAlert(for: release)
+            }
+        updates.start()
+    }
+    
+    private func showUpdateAlert(for release: UpdateChecker.Release) {
+        let alert = NSAlert()
+        alert.messageText = L(.updAlertTitle)
+        alert.informativeText = String(format: L(.updAlertMsg), release.version, updates.currentVersion)
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: L(.btnDownload))
+        alert.addButton(withTitle: L(.btnLater))
+        if let appIcon = NSApp.applicationIconImage {
+            alert.icon = appIcon
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(release.bestURL)
+        }
+    }
+    
+    @objc private func downloadUpdate() {
+        guard let release = updates.available else { return }
+        NSWorkspace.shared.open(release.bestURL)
     }
     
     @objc private func openAccessibilitySettings() {

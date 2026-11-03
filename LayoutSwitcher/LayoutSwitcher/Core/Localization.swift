@@ -73,6 +73,10 @@ enum LK: String {
     case secConfigErrors, statusValid, statusInvalid
     case secLanguage, langSystem
     case cmdAbout, cmdQuit
+    // Обновления
+    case menuDownloadUpdate, updAlertTitle, updAlertMsg, btnDownload
+    case secUpdates, lblCheckUpdates, updDesc, btnCheckNow
+    case updStatusNever, updStatusChecking, updStatusUpToDate, updStatusAvailable, updStatusFailed
 }
 
 /// Менеджер локализации интерфейса: хранит выбранный язык, разрешает эффективный
@@ -308,6 +312,25 @@ final class LocalizationManager: ObservableObject {
         .langSystem: ["ru": "Система", "en": "System"],
         .cmdAbout: ["ru": "О программе Layout Switcher", "en": "About Layout Switcher"],
         .cmdQuit: ["ru": "Выйти из Layout Switcher", "en": "Quit Layout Switcher"],
+
+        // Обновления
+        .menuDownloadUpdate: ["ru": "⬆️ Скачать версию %@…", "en": "⬆️ Download version %@…"],
+        .updAlertTitle: ["ru": "Доступна новая версия", "en": "A new version is available"],
+        .updAlertMsg: ["ru": "Вышла версия %@ Layout Switcher (установлена %@).\n\nСкачать DMG с GitHub?",
+                       "en": "Layout Switcher %@ is out (you have %@).\n\nDownload the DMG from GitHub?"],
+        .btnDownload: ["ru": "Скачать", "en": "Download"],
+        .secUpdates: ["ru": "Обновления", "en": "Updates"],
+        .lblCheckUpdates: ["ru": "Проверять новые версии при запуске и раз в сутки",
+                           "en": "Check for new versions at launch and once a day"],
+        .updDesc: ["ru": "Приложение запрашивает у GitHub последний релиз и сравнивает его с установленной версией. Ничего не скачивается и не устанавливается само.",
+                   "en": "The app asks GitHub for the latest release and compares it with the installed version. Nothing is downloaded or installed automatically."],
+        .btnCheckNow: ["ru": "Проверить сейчас", "en": "Check now"],
+        .updStatusNever: ["ru": "Ещё не проверялось", "en": "Not checked yet"],
+        .updStatusChecking: ["ru": "Проверка…", "en": "Checking…"],
+        .updStatusUpToDate: ["ru": "Установлена последняя версия (проверено %@)",
+                             "en": "You have the latest version (checked %@)"],
+        .updStatusAvailable: ["ru": "Доступна версия %@", "en": "Version %@ is available"],
+        .updStatusFailed: ["ru": "Не удалось проверить (%@)", "en": "Check failed (%@)"],
     ]
 }
 

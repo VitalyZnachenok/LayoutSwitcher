@@ -14,6 +14,7 @@ import os.log
 struct SettingsView: View {
     @ObservedObject var settings: SettingsManager
     @ObservedObject private var loc = LocalizationManager.shared
+    @ObservedObject private var updates = UpdateChecker.shared
     @State private var isVisible = false
     @State private var isRecordingHotkey = false
     @State private var hotkeyRecorderMonitor: Any?
@@ -46,6 +47,7 @@ struct SettingsView: View {
                     layoutPairSection
                     replacementSection
                     soundSection
+                    updatesSection
                     
                     if !settings.configurationErrors.isEmpty {
                         validationErrorsView
@@ -520,6 +522,55 @@ struct SettingsView: View {
                 .padding(.leading, 16)
             }
         }
+    }
+    
+    // MARK: - Updates
+    
+    private var updatesSection: some View {
+        sectionCard {
+            Label(L(.secUpdates), systemImage: "arrow.down.circle")
+                .font(.headline)
+            Toggle(L(.lblCheckUpdates), isOn: $updates.isEnabled)
+                .toggleStyle(.switch)
+            Text(L(.updDesc))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                Button(L(.btnCheckNow)) {
+                    Task { await updates.check() }
+                }
+                .disabled(updates.status == .checking)
+                if let release = updates.available {
+                    Button(String(format: L(.menuDownloadUpdate), release.version)) {
+                        NSWorkspace.shared.open(release.bestURL)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                Spacer()
+                Text(updateStatusText)
+                    .font(.caption)
+                    .foregroundStyle(updateStatusIsAlert ? Color.orange : Color.secondary)
+            }
+        }
+    }
+    
+    private var updateStatusText: String {
+        switch updates.status {
+        case .never: return L(.updStatusNever)
+        case .checking: return L(.updStatusChecking)
+        case .upToDate(let date): return String(format: L(.updStatusUpToDate), shortDate(date))
+        case .available(let release): return String(format: L(.updStatusAvailable), release.version)
+        case .failed(let date): return String(format: L(.updStatusFailed), shortDate(date))
+        }
+    }
+    
+    private var updateStatusIsAlert: Bool {
+        if case .available = updates.status { return true }
+        return false
+    }
+    
+    private func shortDate(_ date: Date) -> String {
+        date.formatted(date: .abbreviated, time: .shortened)
     }
     
     private func soundPicker(title: String, selection: Binding<String>) -> some View {
