@@ -650,6 +650,8 @@ final class HotKeyManager: ObservableObject {
             
             // Сколько позиций вернуть курсор вправо после вставки (для слова перед границей).
             var restoreCursorRight = 0
+            /// Слово найдено по счётчикам клавиш (а не по выделению пользователя).
+            var usedTracker = false
             
             // 2. Выделения нет — выделяем последнее набранное слово по счётчикам клавиш.
             if copiedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
@@ -660,11 +662,12 @@ final class HotKeyManager: ObservableObject {
                     try await selectBack(snapshot.wordBeforeBoundaryLength)
                     restoreCursorRight = snapshot.boundaryCount
                 } else {
-                    Logger.conversion.warning("Nothing selected and no tracked word - aborting")
+                    Logger.conversion.warning("Nothing selected and no tracked word - aborting (snapshot: word=\(snapshot.wordLength), before=\(snapshot.wordBeforeBoundaryLength), boundary=\(snapshot.boundaryCount))")
                     clipboardState.restore(to: pasteboard)
                     await fail(.noTextSelected)
                     return
                 }
+                usedTracker = true
                 let beforeCount = pasteboard.changeCount
                 try await simulateKeyPress(key: KeyCode.c, modifiers: .maskCommand)
                 copiedText = await waitForCopiedText(initialChangeCount: beforeCount, pasteboard: pasteboard)
@@ -705,7 +708,21 @@ final class HotKeyManager: ObservableObject {
             
             // 7. Переключаем клавиатуру на раскладку сконвертированного текста.
             switchLayout(after: converted, cfg: cfg)
-            resetWordTrackingFromMainActor()
+            if usedTracker {
+                // Курсор на прежнем месте, слово той же природы — оставляем счётчики,
+                // чтобы повторное нажатие сконвертировало его обратно.
+                var kept = snapshot
+                if kept.wordLength > 0 {
+                    kept.wordLength = converted.text.count
+                } else {
+                    kept.wordBeforeBoundaryLength = converted.text.count
+                }
+                performOnEventThread { [weak self] in
+                    self?.tracker.restore(kept)
+                }
+            } else {
+                resetWordTrackingFromMainActor()
+            }
             
             metrics.recordSuccess(duration: Date().timeIntervalSince(startTime), viaAccessibility: false)
             await playSuccessSound()

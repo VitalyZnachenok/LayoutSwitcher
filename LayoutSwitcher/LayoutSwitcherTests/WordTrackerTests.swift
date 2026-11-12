@@ -77,4 +77,18 @@ final class WordTrackerTests: XCTestCase {
         let finished = type("don't-stop ", into: &t)
         XCTAssertEqual(finished, ["don't-stop"])
     }
+    
+    func testRestoreKeepsCountersAndClearsBuffer() {
+        var t = WordTracker()
+        _ = type("ghbdtn", into: &t)
+        let snapshot = t.snapshot
+        t.reset()
+        t.restore(snapshot)
+        XCTAssertEqual(t.snapshot.wordLength, 6)
+        XCTAssertEqual(t.typingBuffer, "")
+        // Уже сконвертированное слово детектору повторно не отдаётся.
+        XCTAssertNil(t.feed(.space))
+        XCTAssertEqual(t.snapshot.wordBeforeBoundaryLength, 6)
+        XCTAssertEqual(t.snapshot.boundaryCount, 1)
+    }
 }

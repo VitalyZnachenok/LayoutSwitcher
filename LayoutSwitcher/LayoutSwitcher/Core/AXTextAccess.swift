@@ -82,9 +82,9 @@ enum AXTextAccess {
     
     // MARK: Writing
     
-    /// Заменяет `range` на `text` и ставит курсор в `caretAt`. true — поле
-    /// подтвердило замену (значение изменилось). false — ничего не изменилось,
-    /// можно безопасно откатиться на буфер обмена.
+    /// Заменяет `range` на `text` и ставит курсор в `caretAt`. true — содержимое
+    /// поля изменилось (независимо от кода возврата AX). false — ничего не
+    /// изменилось, можно безопасно откатиться на буфер обмена.
     static func replace(range: NSRange, with text: String, in target: Target, caretAt: Int) -> Bool {
         var cfRange = CFRange(location: range.location, length: range.length)
         guard let rangeValue = AXValueCreate(.cfRange, &cfRange) else { return false }
@@ -92,24 +92,37 @@ enum AXTextAccess {
             Logger.conversion.debug("AX: cannot set selection range")
             return false
         }
-        guard AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString, text as CFTypeRef) == .success else {
-            Logger.conversion.debug("AX: cannot set selected text")
-            return false
-        }
+        let setStatus = AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
         
-        // Проверяем, что поле действительно изменилось: некоторые приложения
-        // отвечают success и ничего не делают.
-        let after: String? = attribute(kAXValueAttribute, of: target.element)
-        if let after, after == (target.value as String) {
-            Logger.conversion.debug("AX: value unchanged after replacement — clipboard path")
-            return false
+        // Кодам возврата верить нельзя в обе стороны: одни приложения отвечают
+        // success и ничего не делают, другие (Telegram) возвращают ошибку, но текст
+        // заменяют. Поэтому исход определяем по фактическому содержимому поля.
+        let original = target.value as String
+        var after: String? = attribute(kAXValueAttribute, of: target.element)
+        if setStatus != .success {
+            Logger.conversion.debug("AX: set selected text returned \(setStatus.rawValue) — verifying field content")
+            // Замена могла примениться асинхронно — даём полю немного времени.
+            var attempts = 0
+            while after == nil || after == original, attempts < 5 {
+                Thread.sleep(forTimeInterval: 0.01)
+                after = attribute(kAXValueAttribute, of: target.element)
+                attempts += 1
+            }
         }
         if let after {
+            guard after != original else {
+                Logger.conversion.debug("AX: value unchanged after replacement — clipboard path")
+                return false
+            }
             let ns = after as NSString
             let expected = NSRange(location: range.location, length: (text as NSString).length)
-            if NSMaxRange(expected) <= ns.length, ns.substring(with: expected) != text {
+            if NSMaxRange(expected) > ns.length || ns.substring(with: expected) != text {
                 Logger.conversion.warning("AX: replacement applied, but the field content differs from the expected text")
             }
+        } else if setStatus != .success {
+            // Ошибка и проверить нечем — считаем, что замены не было.
+            Logger.conversion.debug("AX: cannot set selected text (\(setStatus.rawValue))")
+            return false
         }
         
         var caret = CFRange(location: caretAt, length: 0)
